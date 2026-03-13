@@ -128,6 +128,7 @@ Example:
   "ha_url": "http://your-ha-instance:8123",
   "ha_token": "your_long_lived_access_token",
   "ha_weather_entity": "weather.forecast_home",
+  "display_mode": "auto",
   "selected_entity_ids": [
     "light.kitchen",
     "switch.lamp_socket",
@@ -139,6 +140,7 @@ Example:
 Behavior:
 
 - `ha_url`, `ha_token`, and `ha_weather_entity` are loaded at startup
+- `display_mode` accepts `auto`, `grayscale`, or `color`
 - selected dashboard entities are persisted back into the same file
 - if no config exists, the app can enumerate Home Assistant entities and let the user select what should appear on the dashboard
 
@@ -188,6 +190,7 @@ Manual launch is useful for debugging, but it does not provide the normal Nickel
 ## Related docs
 
 For the fuller Kobo setup and SSH/deploy notes, see [docs/kobo-setup.md](docs/kobo-setup.md).
+For the planned native color rendering work, see [docs/color-output-spec.md](docs/color-output-spec.md).
 
 ## Build options
 

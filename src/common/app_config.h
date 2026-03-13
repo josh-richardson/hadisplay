@@ -1,5 +1,7 @@
 #pragma once
 
+#include "scene.h"
+
 #include <string>
 #include <vector>
 
@@ -10,6 +12,7 @@ struct AppConfig {
     std::string ha_token;
     std::string ha_weather_entity;
     std::vector<std::string> selected_entity_ids;
+    DisplayMode display_mode = DisplayMode::Auto;
 };
 
 struct ConfigLoadResult {

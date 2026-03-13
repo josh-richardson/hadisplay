@@ -3,30 +3,30 @@
 #include "scene.h"
 
 #include <string>
-#include <vector>
 
 namespace hadisplay::scene {
 
 bool contains(const Rect& rect, int x, int y);
-void set_pixel(std::vector<unsigned char>& buffer, int width, int height, int x, int y, unsigned char value);
-void fill_rect(std::vector<unsigned char>& buffer, int width, int height, const Rect& rect, unsigned char value);
-void draw_rect(std::vector<unsigned char>& buffer, int width, int height, const Rect& rect, unsigned char value);
+RenderBuffer make_render_buffer(int width, int height, PixelFormat pixel_format, Color fill);
+void set_pixel(RenderBuffer& buffer, int width, int height, int x, int y, Color value);
+void fill_rect(RenderBuffer& buffer, int width, int height, const Rect& rect, Color value);
+void draw_rect(RenderBuffer& buffer, int width, int height, const Rect& rect, Color value);
 Rect inset_rect(const Rect& rect, int inset);
-void draw_rect_thick(std::vector<unsigned char>& buffer,
+void draw_rect_thick(RenderBuffer& buffer,
                      int width,
                      int height,
                      const Rect& rect,
                      int thickness,
-                     unsigned char value);
-void draw_text(std::vector<unsigned char>& buffer,
+                     Color value);
+void draw_text(RenderBuffer& buffer,
                int width,
                int height,
                int x,
                int y,
                const std::string& text,
                int scale,
-               unsigned char value);
-void draw_line(std::vector<unsigned char>& buffer,
+               Color value);
+void draw_line(RenderBuffer& buffer,
                int width,
                int height,
                int x0,
@@ -34,8 +34,8 @@ void draw_line(std::vector<unsigned char>& buffer,
                int x1,
                int y1,
                int thickness,
-               unsigned char value);
-void draw_arc(std::vector<unsigned char>& buffer,
+               Color value);
+void draw_arc(RenderBuffer& buffer,
               int width,
               int height,
               int cx,
@@ -44,17 +44,17 @@ void draw_arc(std::vector<unsigned char>& buffer,
               double start_radians,
               double end_radians,
               int thickness,
-              unsigned char value);
+              Color value);
 int text_width(const std::string& text, int scale);
 std::string uppercase_ascii(const std::string& input);
 std::string fit_text_to_width(const std::string& text, int scale, int max_width);
-void draw_text_centered(std::vector<unsigned char>& buffer,
+void draw_text_centered(RenderBuffer& buffer,
                         int width,
                         int height,
                         const Rect& rect,
                         int y,
                         const std::string& text,
                         int scale,
-                        unsigned char value);
+                        Color value);
 
 }  // namespace hadisplay::scene

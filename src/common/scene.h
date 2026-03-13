@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,47 @@ enum class ViewMode {
     Setup = 0,
     Dashboard,
     Detail,
+};
+
+enum class DisplayMode {
+    Auto = 0,
+    Grayscale,
+    Color,
+};
+
+enum class PixelFormat {
+    Gray8 = 0,
+    RGBA32,
+};
+
+struct Color {
+    std::uint8_t r = 0U;
+    std::uint8_t g = 0U;
+    std::uint8_t b = 0U;
+    std::uint8_t a = 0xFFU;
+};
+
+struct RenderBuffer {
+    PixelFormat format = PixelFormat::Gray8;
+    int width = 0;
+    int height = 0;
+    std::vector<unsigned char> pixels;
+
+    [[nodiscard]] std::size_t bytes_per_pixel() const {
+        return format == PixelFormat::RGBA32 ? 4U : 1U;
+    }
+
+    [[nodiscard]] std::size_t byte_count() const {
+        return pixels.size();
+    }
+
+    [[nodiscard]] unsigned char* data() {
+        return pixels.data();
+    }
+
+    [[nodiscard]] const unsigned char* data() const {
+        return pixels.data();
+    }
 };
 
 enum class EntityKind {
@@ -114,6 +157,6 @@ struct SceneState {
 
 std::vector<Button> buttons_for(const SceneState& state);
 int button_at(const std::vector<Button>& buttons, int x, int y);
-std::vector<unsigned char> render_scene(const SceneState& state, const std::vector<Button>& buttons);
+RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& buttons, PixelFormat pixel_format);
 
 }  // namespace hadisplay

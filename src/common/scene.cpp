@@ -16,6 +16,11 @@ namespace {
 constexpr int kSetupPageSize = 5;
 constexpr int kDashboardPageSize = 6;
 
+#define kWhite scene::active_theme().white
+#define kLight scene::active_theme().light
+#define kMid scene::active_theme().mid
+#define kDark scene::active_theme().dark
+
 bool weather_is_rainy(const std::string& condition) {
     return condition.find("rain") != std::string::npos ||
            condition.find("pour") != std::string::npos ||
@@ -100,26 +105,26 @@ const Button* find_button(const std::vector<Button>& buttons, ButtonId id, int v
     return nullptr;
 }
 
-void draw_button_frame(std::vector<unsigned char>& buffer,
+void draw_button_frame(RenderBuffer& buffer,
                        int width,
                        int height,
                        const Rect& rect,
                        bool pressed,
                        bool selected) {
-    unsigned char fill = scene::kWhite;
-    unsigned char border = scene::kDark;
+    Color fill = kWhite;
+    Color border = kDark;
     if (pressed) {
-        fill = scene::kDark;
-        border = scene::kDark;
+        fill = kDark;
+        border = kDark;
     } else if (selected) {
-        fill = scene::kLight;
+        fill = scene::active_theme().highlight;
     }
 
     scene::fill_rect(buffer, width, height, rect, fill);
     scene::draw_rect_thick(buffer, width, height, rect, 2, border);
 }
 
-void draw_text_button(std::vector<unsigned char>& buffer,
+void draw_text_button(RenderBuffer& buffer,
                       int width,
                       int height,
                       const Rect& rect,
@@ -127,40 +132,60 @@ void draw_text_button(std::vector<unsigned char>& buffer,
                       bool pressed,
                       bool selected,
                       int scale = 3) {
-    unsigned char fill = scene::kWhite;
-    unsigned char text_color = scene::kDark;
+    Color fill = kWhite;
+    Color text_color = kDark;
+    const std::string upper = scene::uppercase_ascii(label);
+    if (buffer.format == PixelFormat::RGBA32) {
+        if (upper == "RED") {
+            fill = scene::active_theme().accent_red;
+            text_color = kWhite;
+        } else if (upper == "GREEN") {
+            fill = scene::active_theme().accent_green;
+            text_color = kWhite;
+        } else if (upper == "BLUE") {
+            fill = scene::active_theme().accent_blue;
+            text_color = kWhite;
+        } else if (upper == "DAYLIGHT") {
+            fill = scene::active_theme().accent_yellow;
+        } else if (upper == "WARM") {
+            fill = scene::active_theme().accent_orange;
+            text_color = kWhite;
+        } else if (upper == "NEUTRAL") {
+            fill = scene::active_theme().warning;
+        }
+    }
     if (pressed) {
-        fill = scene::kDark;
-        text_color = scene::kWhite;
+        fill = kDark;
+        text_color = kWhite;
     } else if (selected) {
-        fill = scene::kLight;
+        fill = buffer.format == PixelFormat::RGBA32 ? scene::active_theme().highlight : kLight;
     }
     scene::fill_rect(buffer, width, height, rect, fill);
-    scene::draw_rect_thick(buffer, width, height, rect, 2, scene::kDark);
+    scene::draw_rect_thick(buffer, width, height, rect, 2, kDark);
     scene::draw_text_centered(buffer,
                               width,
                               height,
                               rect,
                               rect.y + ((rect.height - (7 * scale)) / 2),
-                              scene::uppercase_ascii(label),
+                              upper,
                               scale,
                               text_color);
 }
 
-void draw_checkbox(std::vector<unsigned char>& buffer,
+void draw_checkbox(RenderBuffer& buffer,
                    int width,
                    int height,
                    const Rect& rect,
                    bool checked) {
-    scene::draw_rect_thick(buffer, width, height, rect, 2, scene::kDark);
+    scene::draw_rect_thick(buffer, width, height, rect, 2, kDark);
     if (!checked) {
         return;
     }
-    scene::draw_line(buffer, width, height, rect.x + 6, rect.y + (rect.height / 2), rect.x + 12, rect.y + rect.height - 8, 3, scene::kDark);
-    scene::draw_line(buffer, width, height, rect.x + 12, rect.y + rect.height - 8, rect.x + rect.width - 6, rect.y + 6, 3, scene::kDark);
+    scene::draw_line(buffer, width, height, rect.x + 6, rect.y + (rect.height / 2), rect.x + 12, rect.y + rect.height - 8, 3, kDark);
+    scene::draw_line(buffer, width, height, rect.x + 12, rect.y + rect.height - 8, rect.x + rect.width - 6, rect.y + 6, 3, kDark);
 }
 
-void draw_header(std::vector<unsigned char>& buffer,
+void draw_header(RenderBuffer& buffer,
                  int width,
                  int height,
                  const scene::SceneLayout& layout,
@@ -174,7 +199,7 @@ void draw_header(std::vector<unsigned char>& buffer,
                      layout.header.y + 10,
                      scene::fit_text_to_width(scene::uppercase_ascii(title), 5, layout.header.width),
                      5,
-                     scene::kDark);
+                     kDark);
     scene::draw_text(buffer,
                      width,
                      height,
@@ -182,7 +207,7 @@ void draw_header(std::vector<unsigned char>& buffer,
                      layout.header.y + 56,
                      scene::fit_text_to_width(scene::uppercase_ascii(subtitle), 2, layout.header.width),
                      2,
-                     scene::kMid);
+                     kMid);
     scene::draw_text(buffer,
                      width,
                      height,
@@ -190,16 +215,16 @@ void draw_header(std::vector<unsigned char>& buffer,
                      layout.header.y + layout.header.height - 28,
                      scene::fit_text_to_width(scene::uppercase_ascii(status), 2, layout.header.width),
                      2,
-                     scene::kDark);
-    scene::fill_rect(buffer, width, height, {layout.header.x, layout.header.y + layout.header.height + 8, layout.header.width, 2}, scene::kMid);
+                     kDark);
+    scene::fill_rect(buffer, width, height, {layout.header.x, layout.header.y + layout.header.height + 8, layout.header.width, 2}, kMid);
 }
 
-void draw_top_bar(std::vector<unsigned char>& buffer,
+void draw_top_bar(RenderBuffer& buffer,
                   const SceneState& state,
                   const scene::SceneLayout& layout,
                   bool brightness_pressed,
                   bool dev_pressed) {
-    scene::fill_rect(buffer, state.width, state.height, layout.system_bar, scene::kDark);
+    scene::fill_rect(buffer, state.width, state.height, layout.system_bar, kDark);
     scene::draw_line(buffer,
                      state.width,
                      state.height,
@@ -208,7 +233,7 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                      state.width - 1,
                      layout.system_bar.height - 2,
                      2,
-                     scene::kMid);
+                     kMid);
 
     scene::draw_text(buffer,
                      state.width,
@@ -217,7 +242,7 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                      layout.system_bar.y + 14,
                      scene::fit_text_to_width(scene::uppercase_ascii(state.time_label), 4, layout.clock_rect.width),
                      4,
-                     scene::kWhite);
+                     kWhite);
     scene::draw_text(buffer,
                      state.width,
                      state.height,
@@ -225,7 +250,7 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                      layout.system_bar.y + 56,
                      scene::fit_text_to_width(scene::uppercase_ascii(state.date_label), 2, layout.clock_rect.width),
                      2,
-                     scene::kLight);
+                     kLight);
 
     if (state.weather_available) {
         if (weather_is_sunny(state.weather_condition)) {
@@ -233,15 +258,15 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                                  state.width,
                                  state.height,
                                  {layout.weather_rect.x + 4, layout.weather_rect.y - 28, 72, layout.weather_rect.height + 18},
-                                 scene::kWhite);
+                                 buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_yellow : kWhite);
         } else {
             scene::draw_cloud_icon(buffer,
                                    state.width,
                                    state.height,
                                    {layout.weather_rect.x - 2, layout.weather_rect.y - 4, 104, layout.weather_rect.height + 26},
                                    weather_is_rainy(state.weather_condition),
-                                   scene::kWhite,
-                                   scene::kLight);
+                                   buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_blue : kWhite,
+                                   kLight);
         }
     }
     scene::draw_text(buffer,
@@ -251,19 +276,19 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                      layout.weather_rect.y + 18,
                      scene::fit_text_to_width(scene::uppercase_ascii(state.weather_range_label), 2, layout.weather_rect.width - 112),
                      2,
-                     scene::kWhite);
+                     kWhite);
 
     scene::draw_status_chip(buffer,
                             state.width,
                             state.height,
                             layout.brightness_button,
-                            scene::kWhite,
-                            brightness_pressed ? scene::kMid : scene::kWhite);
+                            kWhite,
+                            brightness_pressed ? kMid : kWhite);
     scene::draw_sun_icon(buffer,
                          state.width,
                          state.height,
                          {layout.brightness_button.x + 10, layout.brightness_button.y + 6, 40, layout.brightness_button.height - 12},
-                         scene::kDark);
+                         buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_yellow : kDark);
     scene::draw_text_centered(buffer,
                               state.width,
                               state.height,
@@ -274,18 +299,18 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                               layout.brightness_button.y + ((layout.brightness_button.height - 21) / 2),
                               state.brightness_available ? state.brightness_label : "--",
                               3,
-                              scene::kDark);
+                              kDark);
 
     if (state.dev_mode || dev_pressed) {
-        scene::fill_rect(buffer, state.width, state.height, layout.dev_button, dev_pressed ? scene::kLight : scene::kWhite);
+        scene::fill_rect(buffer, state.width, state.height, layout.dev_button, dev_pressed ? kLight : kWhite);
     }
     scene::draw_wrench_icon(buffer,
                             state.width,
                             state.height,
                             {layout.dev_button.x + 4, layout.dev_button.y + 4, layout.dev_button.width - 8, layout.dev_button.height - 8},
-                            state.dev_mode ? scene::kWhite : scene::kMid);
+                            state.dev_mode ? kWhite : kMid);
     if (state.dev_mode) {
-        scene::draw_rect_thick(buffer, state.width, state.height, layout.dev_button, 2, scene::kWhite);
+        scene::draw_rect_thick(buffer, state.width, state.height, layout.dev_button, 2, kWhite);
     }
 
     scene::draw_wifi_icon(buffer,
@@ -293,8 +318,8 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                           state.height,
                           layout.wifi_button,
                           state.wifi_connected,
-                          scene::kWhite,
-                          scene::kMid);
+                          buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_blue : kWhite,
+                          kMid);
 
     scene::draw_battery_icon(buffer,
                              state.width,
@@ -303,8 +328,8 @@ void draw_top_bar(std::vector<unsigned char>& buffer,
                              state.battery_percent,
                              state.battery_charging,
                              state.battery_available,
-                             scene::kWhite,
-                             scene::kMid);
+                             buffer.format == PixelFormat::RGBA32 && state.battery_charging ? scene::active_theme().accent_green : kWhite,
+                             kMid);
 }
 
 std::string setup_summary(const EntityItem& entity) {
@@ -360,7 +385,7 @@ bool entity_supports_dashboard_detail(const EntityItem& entity) {
     return entity.supports_detail;
 }
 
-void draw_setup_view(std::vector<unsigned char>& buffer,
+void draw_setup_view(RenderBuffer& buffer,
                      const SceneState& state,
                      const scene::SceneLayout& layout,
                      const std::vector<Button>& buttons) {
@@ -381,7 +406,7 @@ void draw_setup_view(std::vector<unsigned char>& buffer,
                                   layout.body.y + (layout.body.height / 2) - 24,
                                   "NO DEVICES FOUND",
                                   3,
-                                  scene::kDark);
+                                  kDark);
         return;
     }
 
@@ -410,7 +435,7 @@ void draw_setup_view(std::vector<unsigned char>& buffer,
                          row.y + 18,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.name), 3, row.width - 188),
                          3,
-                         pressed ? scene::kWhite : scene::kDark);
+                         pressed ? kWhite : kDark);
 
         scene::draw_text(buffer,
                          state.width,
@@ -419,7 +444,7 @@ void draw_setup_view(std::vector<unsigned char>& buffer,
                          row.y + 18,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.kind_label), 2, 132),
                          2,
-                         pressed ? scene::kLight : scene::kMid);
+                         pressed ? kLight : kMid);
 
         scene::draw_text(buffer,
                          state.width,
@@ -428,7 +453,7 @@ void draw_setup_view(std::vector<unsigned char>& buffer,
                          row.y + row.height - 54,
                          scene::fit_text_to_width(scene::uppercase_ascii(setup_summary(entity)), 2, row.width - 240),
                          2,
-                         pressed ? scene::kLight : scene::kMid);
+                         pressed ? kLight : kMid);
 
         scene::draw_text(buffer,
                          state.width,
@@ -437,11 +462,11 @@ void draw_setup_view(std::vector<unsigned char>& buffer,
                          row.y + row.height - 54,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.state_label), 2, 148),
                          2,
-                         pressed ? scene::kWhite : scene::kDark);
+                         pressed ? kWhite : kDark);
     }
 }
 
-void draw_dashboard_view(std::vector<unsigned char>& buffer,
+void draw_dashboard_view(RenderBuffer& buffer,
                          const SceneState& state,
                          const scene::SceneLayout& layout,
                          const std::vector<Button>& buttons) {
@@ -463,7 +488,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                                   layout.body.y + (layout.body.height / 2) - 24,
                                   "NO DEVICES CONFIGURED",
                                   3,
-                                  scene::kDark);
+                                  kDark);
         scene::draw_text_centered(buffer,
                                   state.width,
                                   state.height,
@@ -471,7 +496,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                                   layout.body.y + (layout.body.height / 2) + 24,
                                   "OPEN SETUP TO SELECT THEM",
                                   2,
-                                  scene::kMid);
+                                  kMid);
         return;
     }
 
@@ -499,7 +524,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                          card.y + 18,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.name), 3, card.width - 110),
                          3,
-                         pressed ? scene::kWhite : scene::kDark);
+                         pressed ? kWhite : kDark);
         scene::draw_text(buffer,
                          state.width,
                          state.height,
@@ -507,7 +532,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                          card.y + 52,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.kind_label), 2, card.width - 110),
                          2,
-                         pressed ? scene::kLight : scene::kMid);
+                         pressed ? kLight : kMid);
 
         scene::draw_text(buffer,
                          state.width,
@@ -516,7 +541,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                          card.y + 90,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.state_label), 4, card.width - 110),
                          4,
-                         pressed ? scene::kWhite : scene::kDark);
+                         pressed ? kWhite : kDark);
 
         if (entity.kind == EntityKind::Climate && !entity.hvac_action.empty()) {
             scene::draw_text(buffer,
@@ -526,7 +551,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                              card.y + 134,
                              scene::fit_text_to_width(scene::uppercase_ascii(entity.hvac_action), 2, card.width - 110),
                              2,
-                             pressed ? scene::kLight : scene::kDark);
+                             pressed ? kLight : kDark);
         }
 
         scene::draw_text(buffer,
@@ -536,7 +561,7 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                          card.y + card.height - 46,
                          scene::fit_text_to_width(scene::uppercase_ascii(dashboard_detail(entity)), 2, card.width - 110),
                          2,
-                         pressed ? scene::kLight : scene::kMid);
+                         pressed ? kLight : kMid);
 
         if (detail_button != nullptr && entity_supports_dashboard_detail(entity)) {
             const bool detail_pressed = detail_button_index == state.pressed_button;
@@ -553,12 +578,12 @@ void draw_dashboard_view(std::vector<unsigned char>& buffer,
                                  state.width,
                                  state.height,
                                  {detail_button->rect.x + 8, detail_button->rect.y + 8, detail_button->rect.width - 16, detail_button->rect.height - 16},
-                                 detail_pressed ? scene::kWhite : scene::kDark);
+                                 detail_pressed ? kWhite : kDark);
         }
     }
 }
 
-void draw_detail_row(std::vector<unsigned char>& buffer,
+void draw_detail_row(RenderBuffer& buffer,
                      int width,
                      int height,
                      const Rect& row,
@@ -569,10 +594,10 @@ void draw_detail_row(std::vector<unsigned char>& buffer,
                      const Button* plus_button,
                      int plus_button_index,
                      const SceneState& state) {
-    scene::fill_rect(buffer, width, height, row, scene::kWhite);
-    scene::draw_rect_thick(buffer, width, height, row, 2, scene::kDark);
-    scene::draw_text(buffer, width, height, row.x + 18, row.y + 20, scene::uppercase_ascii(label), 3, scene::kDark);
-    scene::draw_text(buffer, width, height, row.x + 18, row.y + row.height - 36, scene::uppercase_ascii(value), 2, scene::kMid);
+    scene::fill_rect(buffer, width, height, row, kWhite);
+    scene::draw_rect_thick(buffer, width, height, row, 2, kDark);
+    scene::draw_text(buffer, width, height, row.x + 18, row.y + 20, scene::uppercase_ascii(label), 3, kDark);
+    scene::draw_text(buffer, width, height, row.x + 18, row.y + row.height - 36, scene::uppercase_ascii(value), 2, kMid);
 
     if (minus_button != nullptr) {
         draw_text_button(buffer,
@@ -596,19 +621,19 @@ void draw_detail_row(std::vector<unsigned char>& buffer,
     }
 }
 
-void draw_climate_info_row(std::vector<unsigned char>& buffer,
+void draw_climate_info_row(RenderBuffer& buffer,
                            int width,
                            int height,
                            const Rect& row,
                            const std::string& label,
                            const std::string& value) {
-    scene::fill_rect(buffer, width, height, row, scene::kWhite);
-    scene::draw_rect_thick(buffer, width, height, row, 2, scene::kDark);
-    scene::draw_text(buffer, width, height, row.x + 18, row.y + 18, scene::uppercase_ascii(label), 2, scene::kMid);
-    scene::draw_text(buffer, width, height, row.x + 18, row.y + 40, scene::uppercase_ascii(value), 3, scene::kDark);
+    scene::fill_rect(buffer, width, height, row, kWhite);
+    scene::draw_rect_thick(buffer, width, height, row, 2, kDark);
+    scene::draw_text(buffer, width, height, row.x + 18, row.y + 18, scene::uppercase_ascii(label), 2, kMid);
+    scene::draw_text(buffer, width, height, row.x + 18, row.y + 40, scene::uppercase_ascii(value), 3, kDark);
 }
 
-void draw_detail_view(std::vector<unsigned char>& buffer,
+void draw_detail_view(RenderBuffer& buffer,
                       const SceneState& state,
                       const scene::SceneLayout& layout,
                       const std::vector<Button>& buttons) {
@@ -633,9 +658,13 @@ void draw_detail_view(std::vector<unsigned char>& buffer,
         layout.body.width,
         160,
     };
-    scene::fill_rect(buffer, state.width, state.height, summary, scene::kLight);
-    scene::draw_rect_thick(buffer, state.width, state.height, summary, 2, scene::kDark);
-    scene::draw_text(buffer, state.width, state.height, summary.x + 20, summary.y + 18, scene::uppercase_ascii(entity.state_label), 5, scene::kDark);
+    Color summary_fill = kLight;
+    if (buffer.format == PixelFormat::RGBA32) {
+        summary_fill = entity.kind == EntityKind::Climate ? scene::active_theme().highlight : scene::active_theme().warning;
+    }
+    scene::fill_rect(buffer, state.width, state.height, summary, summary_fill);
+    scene::draw_rect_thick(buffer, state.width, state.height, summary, 2, kDark);
+    scene::draw_text(buffer, state.width, state.height, summary.x + 20, summary.y + 18, scene::uppercase_ascii(entity.state_label), 5, kDark);
 
     std::string summary_detail;
     if (entity.kind == EntityKind::Light) {
@@ -655,7 +684,7 @@ void draw_detail_view(std::vector<unsigned char>& buffer,
                      summary.y + 90,
                      scene::fit_text_to_width(scene::uppercase_ascii(summary_detail), 2, summary.width - 40),
                      2,
-                     scene::kDark);
+                     kDark);
 
     int toggle_button_index = -1;
     const Button* toggle_button = find_button(buttons, ButtonId::DetailToggleLight, state.detail_entity_index, &toggle_button_index);
@@ -752,10 +781,10 @@ void draw_detail_view(std::vector<unsigned char>& buffer,
                               layout.body.y + 300,
                               "NO EXTRA CONTROLS",
                               3,
-                              scene::kMid);
+                              kMid);
 }
 
-void draw_footer_buttons(std::vector<unsigned char>& buffer,
+void draw_footer_buttons(RenderBuffer& buffer,
                          const SceneState& state,
                          const std::vector<Button>& buttons) {
     for (std::size_t i = 0; i < buttons.size(); ++i) {
@@ -913,8 +942,9 @@ int button_at(const std::vector<Button>& buttons, int x, int y) {
     return -1;
 }
 
-std::vector<unsigned char> render_scene(const SceneState& state, const std::vector<Button>& buttons) {
-    std::vector<unsigned char> buffer(static_cast<std::size_t>(state.width) * static_cast<std::size_t>(state.height), scene::kWhite);
+RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& buttons, PixelFormat pixel_format) {
+    scene::set_active_theme(scene::theme_for(pixel_format));
+    RenderBuffer buffer = scene::make_render_buffer(state.width, state.height, pixel_format, kWhite);
     const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height);
 
     int brightness_button_index = -1;
@@ -927,8 +957,8 @@ std::vector<unsigned char> render_scene(const SceneState& state, const std::vect
                  brightness_button_index == state.pressed_button,
                  dev_button_index == state.pressed_button);
 
-    scene::fill_rect(buffer, state.width, state.height, layout.outer, scene::kWhite);
-    scene::draw_rect_thick(buffer, state.width, state.height, layout.outer, 2, scene::kDark);
+    scene::fill_rect(buffer, state.width, state.height, layout.outer, kWhite);
+    scene::draw_rect_thick(buffer, state.width, state.height, layout.outer, 2, kDark);
 
     switch (state.view_mode) {
         case ViewMode::Setup:

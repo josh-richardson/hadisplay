@@ -1,6 +1,4 @@
-#include "ha_client.h"
 #include "scene.h"
-#include "system_status.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -9,91 +7,14 @@
 #include <linux/fb.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <vector>
 
 namespace {
-
-std::string uppercase_ascii(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::toupper(ch));
-    });
-    return value;
-}
-
-std::string concise_ha_error(const std::string& message) {
-    const std::string lower = [] (std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
-        return value;
-    }(message);
-
-    if (lower.find(".env") != std::string::npos || lower.find("ha_url") != std::string::npos ||
-        lower.find("ha_token") != std::string::npos) {
-        return "CHECK .ENV";
-    }
-    if (lower.find("timed out") != std::string::npos || lower.find("couldn't connect") != std::string::npos ||
-        lower.find("could not resolve host") != std::string::npos || lower.find("failed to connect") != std::string::npos) {
-        return "HA UNREACHABLE";
-    }
-    return "HA REQUEST FAILED";
-}
-
-std::string entity_state_label(const std::string& state) {
-    if (state == "on") {
-        return "ON";
-    }
-    if (state == "off") {
-        return "OFF";
-    }
-    if (state == "unavailable") {
-        return "UNAVAILABLE";
-    }
-    if (state == "unknown") {
-        return "UNKNOWN";
-    }
-    return uppercase_ascii(state);
-}
-
-void apply_entity_state(hadisplay::SceneState& scene_state, const ha::EntityState& entity_state) {
-    if (!entity_state.friendly_name.empty()) {
-        scene_state.entity_name = entity_state.friendly_name;
-    }
-    scene_state.entity_state = entity_state_label(entity_state.state);
-}
-
-void apply_system_status(hadisplay::SceneState& scene_state, const hadisplay::SystemStatus& status) {
-    scene_state.time_label = status.time_label;
-    scene_state.date_label = status.date_label;
-    scene_state.wifi_label = status.wifi_label;
-    scene_state.wifi_connected = status.wifi_connected;
-    scene_state.battery_label = status.battery_label;
-    scene_state.battery_available = status.battery_available;
-    scene_state.battery_percent = status.battery_percent;
-    scene_state.battery_charging = status.battery_charging;
-    scene_state.brightness_label = status.brightness_label;
-    scene_state.brightness_percent = status.brightness_percent;
-    scene_state.brightness_available = status.brightness_available;
-}
-
-void apply_weather_state(hadisplay::SceneState& scene_state, const ha::WeatherState& weather) {
-    scene_state.weather_available = weather.ok;
-    scene_state.weather_condition = weather.condition;
-    if (weather.ok) {
-        scene_state.weather_range_label = std::to_string(weather.temperature_low) + "/" +
-                                         std::to_string(weather.temperature_high) +
-                                         weather.temperature_unit;
-    } else {
-        scene_state.weather_range_label = "--/--";
-    }
-}
 
 unsigned char scale_component(std::uint32_t value, std::uint32_t bits) {
     if (bits == 0U) {
@@ -203,24 +124,97 @@ bool present_dump(Display* display, int screen, Window window, GC gc, const FBIn
     return true;
 }
 
+hadisplay::SceneState sample_scene_state(int width, int height, bool color_mode) {
+    hadisplay::SceneState state{};
+    state.width = width;
+    state.height = height;
+    state.view_mode = hadisplay::ViewMode::Dashboard;
+    state.time_label = "19:58";
+    state.date_label = "FRI 13 MAR";
+    state.weather_available = true;
+    state.weather_condition = "sunny";
+    state.weather_range_label = "6/12C";
+    state.wifi_connected = true;
+    state.wifi_label = "ON";
+    state.battery_available = true;
+    state.battery_charging = true;
+    state.battery_percent = 84;
+    state.battery_label = "84%";
+    state.brightness_available = true;
+    state.brightness_percent = 60;
+    state.brightness_label = "60%";
+    state.status = color_mode ? "MIRROR COLOR MODE" : "MIRROR GRAYSCALE MODE";
+    state.entities = {
+        {
+            .kind = hadisplay::EntityKind::Light,
+            .entity_id = "light.office",
+            .name = "Office Lamp",
+            .kind_label = "LIGHT",
+            .state_label = "ON",
+            .is_on = true,
+            .available = true,
+            .selected = true,
+            .supports_detail = true,
+            .supports_brightness = true,
+            .supports_color_temp = true,
+            .supports_rgb = true,
+            .brightness_percent = 72,
+        },
+        {
+            .kind = hadisplay::EntityKind::Switch,
+            .entity_id = "switch.speakers",
+            .name = "Speakers",
+            .kind_label = "SOCKET",
+            .state_label = "OFF",
+            .available = true,
+            .selected = true,
+        },
+        {
+            .kind = hadisplay::EntityKind::Climate,
+            .entity_id = "climate.hallway",
+            .name = "Hallway Heat",
+            .kind_label = "THERMOSTAT",
+            .state_label = "HEATING",
+            .is_on = true,
+            .available = true,
+            .selected = true,
+            .supports_detail = true,
+            .supports_heat_control = true,
+            .current_temperature = 20,
+            .target_temperature = 22,
+            .hvac_action = "heating",
+        },
+    };
+    return state;
+}
+
 bool render_and_present(int fbfd,
-                        const hadisplay::SceneState& scene_state,
-                        const std::vector<hadisplay::Button>& buttons,
+                        const FBInkState& fb_state,
+                        bool color_mode,
                         Display* display,
                         int screen,
                         Window window,
                         GC gc) {
-    const auto buffer = hadisplay::render_scene(scene_state, buttons);
+    const hadisplay::SceneState scene_state = sample_scene_state(std::min(1024, static_cast<int>(fb_state.view_width)),
+                                                                 std::min(768, static_cast<int>(fb_state.view_height)),
+                                                                 color_mode);
+    const auto buttons = hadisplay::buttons_for(scene_state);
+    const auto buffer = hadisplay::render_scene(scene_state,
+                                                buttons,
+                                                color_mode ? hadisplay::PixelFormat::RGBA32 : hadisplay::PixelFormat::Gray8);
 
     FBInkConfig draw_cfg{};
     draw_cfg.is_quiet = true;
     draw_cfg.no_refresh = true;
+    if (color_mode) {
+        draw_cfg.wfm_mode = WFM_GCC16;
+    }
 
     if (fbink_print_raw_data(fbfd,
-                             const_cast<unsigned char*>(buffer.data()),
+                             buffer.pixels.data(),
                              scene_state.width,
                              scene_state.height,
-                             buffer.size(),
+                             buffer.pixels.size(),
                              0,
                              0,
                              &draw_cfg) < 0) {
@@ -272,30 +266,7 @@ int main() {
 
     FBInkState fb_state{};
     fbink_get_state(&fbink_cfg, &fb_state);
-
-    hadisplay::SceneState scene_state{};
-    scene_state.width = std::min(1024, static_cast<int>(fb_state.view_width));
-    scene_state.height = std::min(768, static_cast<int>(fb_state.view_height));
-    scene_state.device_name = "HOST FBINK MIRROR";
-    hadisplay::DeviceStatus device_status;
-    apply_system_status(scene_state, device_status.snapshot());
-
-    ha::Client ha_client;
-    apply_weather_state(scene_state, ha_client.fetch_weather_state());
-    if (ha_client.configured()) {
-        const ha::EntityState entity_state = ha_client.fetch_josh_light_state();
-        if (entity_state.ok) {
-            apply_entity_state(scene_state, entity_state);
-            scene_state.status = "STATE SYNCED";
-        } else {
-            scene_state.status = concise_ha_error(entity_state.message);
-        }
-    } else {
-        scene_state.entity_state = "CONFIG";
-        scene_state.status = "CHECK .ENV";
-    }
-
-    const auto buttons = hadisplay::buttons_for(scene_state.width, scene_state.height);
+    bool color_mode = fb_state.has_color_panel;
 
     Display* display = XOpenDisplay(nullptr);
     if (display == nullptr) {
@@ -306,17 +277,19 @@ int main() {
 
     const int screen = DefaultScreen(display);
     const Window root = RootWindow(display, screen);
+    const int window_width = std::min(1024, static_cast<int>(fb_state.view_width));
+    const int window_height = std::min(768, static_cast<int>(fb_state.view_height));
 
     XSetWindowAttributes attrs{};
     attrs.background_pixel = WhitePixel(display, screen);
-    attrs.event_mask = ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | StructureNotifyMask;
+    attrs.event_mask = ExposureMask | KeyPressMask | StructureNotifyMask;
 
     Window window = XCreateWindow(display,
                                   root,
                                   80,
                                   80,
-                                  static_cast<unsigned int>(scene_state.width),
-                                  static_cast<unsigned int>(scene_state.height),
+                                  static_cast<unsigned int>(window_width),
+                                  static_cast<unsigned int>(window_height),
                                   0,
                                   CopyFromParent,
                                   InputOutput,
@@ -329,8 +302,7 @@ int main() {
     XMapWindow(display, window);
 
     GC gc = XCreateGC(display, window, 0, nullptr);
-
-    if (!render_and_present(fbfd, scene_state, buttons, display, screen, window, gc)) {
+    if (!render_and_present(fbfd, fb_state, color_mode, display, screen, window, gc)) {
         XFreeGC(display, gc);
         XDestroyWindow(display, window);
         XCloseDisplay(display);
@@ -345,7 +317,7 @@ int main() {
         switch (event.type) {
             case Expose:
                 if (event.xexpose.count == 0) {
-                    render_and_present(fbfd, scene_state, buttons, display, screen, window, gc);
+                    render_and_present(fbfd, fb_state, color_mode, display, screen, window, gc);
                 }
                 break;
             case ClientMessage:
@@ -357,61 +329,12 @@ int main() {
                 const KeySym key = XLookupKeysym(&event.xkey, 0);
                 if (key == XK_Escape || key == XK_q) {
                     running = false;
+                } else if ((key == XK_c || key == XK_C) && fb_state.has_color_panel) {
+                    color_mode = !color_mode;
+                    render_and_present(fbfd, fb_state, color_mode, display, screen, window, gc);
                 }
                 break;
             }
-            case ButtonPress:
-                if (event.xbutton.button == Button1) {
-                    scene_state.pressed_button = hadisplay::button_at(buttons, event.xbutton.x, event.xbutton.y);
-                    render_and_present(fbfd, scene_state, buttons, display, screen, window, gc);
-                }
-                break;
-            case ButtonRelease:
-                if (event.xbutton.button == Button1) {
-                    const int released_on = hadisplay::button_at(buttons, event.xbutton.x, event.xbutton.y);
-                    if (scene_state.pressed_button >= 0 && scene_state.pressed_button == released_on) {
-                        scene_state.selected_button = released_on;
-                        if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::ToggleLight) {
-                            scene_state.status = "TOGGLING LIGHT";
-                            scene_state.pressed_button = -1;
-                            render_and_present(fbfd, scene_state, buttons, display, screen, window, gc);
-                            const auto result = ha_client.toggle_josh_light();
-                            if (!result.ok) {
-                                scene_state.status = concise_ha_error(result.message);
-                            } else {
-                                const auto entity_state = ha_client.fetch_josh_light_state();
-                                if (entity_state.ok) {
-                                    apply_entity_state(scene_state, entity_state);
-                                    scene_state.status = "LIGHT UPDATED";
-                                } else {
-                                    scene_state.status = concise_ha_error(entity_state.message);
-                                }
-                            }
-                        } else if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::BrightnessToggle) {
-                            hadisplay::SystemStatus system_status;
-                            if (device_status.cycle_brightness(system_status)) {
-                                apply_system_status(scene_state, system_status);
-                            }
-                        } else if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::DevModeToggle) {
-                            scene_state.dev_mode = !scene_state.dev_mode;
-                        } else if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::RefreshState) {
-                            const auto entity_state = ha_client.fetch_josh_light_state();
-                            if (entity_state.ok) {
-                                apply_entity_state(scene_state, entity_state);
-                                scene_state.status = "STATE SYNCED";
-                            } else {
-                                scene_state.status = concise_ha_error(entity_state.message);
-                            }
-                        } else if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::FullRefresh) {
-                            scene_state.status = "SCREEN REFRESHED";
-                        } else if (buttons[static_cast<std::size_t>(released_on)].id == hadisplay::ButtonId::Exit) {
-                            running = false;
-                        }
-                    }
-                    scene_state.pressed_button = -1;
-                    render_and_present(fbfd, scene_state, buttons, display, screen, window, gc);
-                }
-                break;
             default:
                 break;
         }

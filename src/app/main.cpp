@@ -49,6 +49,13 @@ struct RenderState {
     std::chrono::steady_clock::time_point last_full_refresh = std::chrono::steady_clock::now();
 };
 
+struct DisplaySettings {
+    hadisplay::DisplayMode requested_mode = hadisplay::DisplayMode::Auto;
+    hadisplay::DisplayMode effective_mode = hadisplay::DisplayMode::Grayscale;
+    hadisplay::PixelFormat pixel_format = hadisplay::PixelFormat::Gray8;
+    bool has_color_panel = false;
+};
+
 struct ClockStatus {
     std::string time_label;
     std::string date_label;
@@ -363,22 +370,51 @@ bool should_do_full_refresh(const RenderState& render_state, bool force_full_ref
     return (std::chrono::steady_clock::now() - render_state.last_full_refresh) >= kFullRefreshInterval;
 }
 
+DisplaySettings resolve_display_settings(const FBInkState& fb_state, hadisplay::DisplayMode requested_mode) {
+    const bool has_color_panel = fb_state.has_color_panel;
+    const hadisplay::DisplayMode effective_mode = [&]() {
+        switch (requested_mode) {
+            case hadisplay::DisplayMode::Color:
+                return has_color_panel ? hadisplay::DisplayMode::Color : hadisplay::DisplayMode::Grayscale;
+            case hadisplay::DisplayMode::Grayscale:
+                return hadisplay::DisplayMode::Grayscale;
+            case hadisplay::DisplayMode::Auto:
+                return has_color_panel ? hadisplay::DisplayMode::Color : hadisplay::DisplayMode::Grayscale;
+        }
+        return hadisplay::DisplayMode::Grayscale;
+    }();
+
+    return {
+        .requested_mode = requested_mode,
+        .effective_mode = effective_mode,
+        .pixel_format = effective_mode == hadisplay::DisplayMode::Color ? hadisplay::PixelFormat::RGBA32
+                                                                        : hadisplay::PixelFormat::Gray8,
+        .has_color_panel = has_color_panel,
+    };
+}
+
 bool render(int fbfd,
             const hadisplay::SceneState& state,
             const std::vector<hadisplay::Button>& buttons,
+            const DisplaySettings& display_settings,
             RenderState& render_state,
             bool force_full_refresh = false) {
-    const auto buffer = hadisplay::render_scene(state, buttons);
+    const auto buffer = hadisplay::render_scene(state, buttons, display_settings.pixel_format);
 
     FBInkConfig cfg{};
     cfg.is_quiet = true;
-    cfg.is_flashing = should_do_full_refresh(render_state, force_full_refresh);
+    if (display_settings.effective_mode == hadisplay::DisplayMode::Color) {
+        cfg.is_flashing = should_do_full_refresh(render_state, force_full_refresh);
+        cfg.wfm_mode = cfg.is_flashing ? WFM_GCC16 : WFM_GLRC16;
+    } else {
+        cfg.is_flashing = should_do_full_refresh(render_state, force_full_refresh);
+    }
 
     if (fbink_print_raw_data(fbfd,
-                             const_cast<unsigned char*>(buffer.data()),
+                             const_cast<unsigned char*>(buffer.pixels.data()),
                              state.width,
                              state.height,
-                             buffer.size(),
+                             buffer.pixels.size(),
                              0,
                              0,
                              &cfg) < 0) {
@@ -396,16 +432,20 @@ bool render(int fbfd,
     return true;
 }
 
-void clear_screen(int fbfd, bool full_refresh) {
+void clear_screen(int fbfd, bool full_refresh, const DisplaySettings& display_settings) {
     FBInkConfig cfg{};
     cfg.is_quiet = true;
     cfg.is_flashing = full_refresh;
+    if (display_settings.effective_mode == hadisplay::DisplayMode::Color) {
+        cfg.wfm_mode = WFM_GCC16;
+    }
     fbink_cls(fbfd, &cfg, nullptr, false);
 }
 
 bool apply_remote_update(int fbfd,
                          hadisplay::SceneState& scene_state,
                          std::vector<hadisplay::Button>& buttons,
+                         const DisplaySettings& display_settings,
                          RenderState& render_state,
                          const ha::Client& ha_client,
                          int entity_index,
@@ -413,7 +453,7 @@ bool apply_remote_update(int fbfd,
                          const std::function<ha::Result()>& request) {
     scene_state.status = busy_status;
     buttons = hadisplay::buttons_for(scene_state);
-    if (!render(fbfd, scene_state, buttons, render_state)) {
+    if (!render(fbfd, scene_state, buttons, display_settings, render_state)) {
         return false;
     }
 
@@ -442,6 +482,7 @@ bool handle_button_action(int fbfd,
                           hadisplay::DeviceStatus& device_status,
                           hadisplay::ConfigStore& config_store,
                           hadisplay::AppConfig& config,
+                          const DisplaySettings& display_settings,
                           bool& config_dirty,
                           RenderState& render_state,
                           int button_index,
@@ -514,6 +555,7 @@ bool handle_button_action(int fbfd,
                 if (!apply_remote_update(fbfd,
                                          scene_state,
                                          buttons,
+                                         display_settings,
                                          render_state,
                                          ha_client,
                                          action_button.value,
@@ -567,6 +609,7 @@ bool handle_button_action(int fbfd,
                 if (!apply_remote_update(fbfd,
                                          scene_state,
                                          buttons,
+                                         display_settings,
                                          render_state,
                                          ha_client,
                                          entity_index,
@@ -697,9 +740,12 @@ int main() {
     hadisplay::ConfigStore config_store;
     const hadisplay::ConfigLoadResult loaded_config = config_store.load();
     hadisplay::AppConfig config = loaded_config.config;
+    const DisplaySettings display_settings = resolve_display_settings(fb_state, config.display_mode);
     bool config_dirty = false;
     if (!loaded_config.ok) {
         scene_state.status = "CONFIG RESET";
+    } else if (config.display_mode == hadisplay::DisplayMode::Color && !display_settings.has_color_panel) {
+        std::cerr << "Color mode requested but FBInk reports no color panel; falling back to grayscale.\n";
     }
 
     ha::Client ha_client({
@@ -740,10 +786,10 @@ int main() {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    clear_screen(fbfd, true);
+    clear_screen(fbfd, true, display_settings);
 
     RenderState render_state{};
-    if (!render(fbfd, scene_state, buttons, render_state, true)) {
+    if (!render(fbfd, scene_state, buttons, display_settings, render_state, true)) {
         ioctl(touchfd, EVIOCGRAB, 0);
         close(touchfd);
         fbink_close(fbfd);
@@ -864,7 +910,7 @@ int main() {
 
         if (needs_redraw) {
             buttons = hadisplay::buttons_for(scene_state);
-            if (!render(fbfd, scene_state, buttons, render_state, force_full_refresh)) {
+            if (!render(fbfd, scene_state, buttons, display_settings, render_state, force_full_refresh)) {
                 break;
             }
             needs_redraw = false;
@@ -880,6 +926,7 @@ int main() {
                                                           device_status,
                                                           config_store,
                                                           config,
+                                                          display_settings,
                                                           config_dirty,
                                                           render_state,
                                                           pending_button,
@@ -894,7 +941,7 @@ int main() {
 
             if (needs_redraw) {
                 buttons = hadisplay::buttons_for(scene_state);
-                if (!render(fbfd, scene_state, buttons, render_state, force_full_refresh)) {
+                if (!render(fbfd, scene_state, buttons, display_settings, render_state, force_full_refresh)) {
                     break;
                 }
                 needs_redraw = false;
@@ -914,7 +961,7 @@ int main() {
         }
     }
 
-    clear_screen(fbfd, true);
+    clear_screen(fbfd, true, display_settings);
     ioctl(touchfd, EVIOCGRAB, 0);
     close(touchfd);
     fbink_close(fbfd);

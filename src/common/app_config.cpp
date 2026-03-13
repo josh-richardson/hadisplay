@@ -14,6 +14,30 @@
 namespace hadisplay {
 namespace {
 
+DisplayMode parse_display_mode(const json::Value* value) {
+    const std::string* mode = value != nullptr ? value->as_string_if() : nullptr;
+    if (mode == nullptr) {
+        return DisplayMode::Auto;
+    }
+
+    if (*mode == "grayscale") {
+        return DisplayMode::Grayscale;
+    }
+    if (*mode == "color") {
+        return DisplayMode::Color;
+    }
+    return DisplayMode::Auto;
+}
+
+std::string display_mode_name(DisplayMode mode) {
+    switch (mode) {
+        case DisplayMode::Grayscale: return "grayscale";
+        case DisplayMode::Color: return "color";
+        case DisplayMode::Auto: return "auto";
+    }
+    return "auto";
+}
+
 std::filesystem::path executable_dir() {
     std::array<char, 4096> buffer{};
     const ssize_t size = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
@@ -105,6 +129,7 @@ ConfigLoadResult ConfigStore::load() const {
             result.config.ha_weather_entity = *value;
         }
     }
+    result.config.display_mode = parse_display_mode(parsed.value.get("display_mode"));
 
     const json::Value* selected = parsed.value.get("selected_entity_ids");
     if (selected == nullptr) {
@@ -163,6 +188,7 @@ bool ConfigStore::save(const AppConfig& config, std::string& error) const {
     if (!config.ha_weather_entity.empty()) {
         root_object["ha_weather_entity"] = json::Value(config.ha_weather_entity);
     }
+    root_object["display_mode"] = json::Value(display_mode_name(config.display_mode));
 
     json::Value root(std::move(root_object));
 

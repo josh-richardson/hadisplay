@@ -12,11 +12,11 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 
-void draw_plug_icon(std::vector<unsigned char>& buffer,
+void draw_plug_icon(RenderBuffer& buffer,
                     int width,
                     int height,
                     const Rect& rect,
-                    unsigned char value) {
+                    Color value) {
     const int cx = rect.x + (rect.width / 2);
     const int top = rect.y + 4;
     draw_line(buffer, width, height, cx - 5, top, cx - 5, top + 10, 3, value);
@@ -27,21 +27,21 @@ void draw_plug_icon(std::vector<unsigned char>& buffer,
 
 }  // namespace
 
-void draw_status_chip(std::vector<unsigned char>& buffer,
+void draw_status_chip(RenderBuffer& buffer,
                       int width,
                       int height,
                       const Rect& rect,
-                      unsigned char border,
-                      unsigned char fill) {
+                      Color border,
+                      Color fill) {
     fill_rect(buffer, width, height, rect, fill);
     draw_rect_thick(buffer, width, height, rect, 2, border);
 }
 
-void draw_sun_icon(std::vector<unsigned char>& buffer,
+void draw_sun_icon(RenderBuffer& buffer,
                    int width,
                    int height,
                    const Rect& rect,
-                   unsigned char value) {
+                   Color value) {
     const int cx = rect.x + (rect.width / 2);
     const int cy = rect.y + (rect.height / 2);
     const int core = std::max(6, std::min(rect.width, rect.height) / 6);
@@ -59,11 +59,11 @@ void draw_sun_icon(std::vector<unsigned char>& buffer,
     }
 }
 
-void draw_wrench_icon(std::vector<unsigned char>& buffer,
+void draw_wrench_icon(RenderBuffer& buffer,
                       int width,
                       int height,
                       const Rect& rect,
-                      unsigned char value) {
+                      Color value) {
     const int left = rect.x + 12;
     const int right = rect.x + rect.width - 14;
     const int top = rect.y + 12;
@@ -78,11 +78,11 @@ void draw_wrench_icon(std::vector<unsigned char>& buffer,
     fill_rect(buffer, width, height, {left - 2, bottom - 8, 10, 10}, value);
 }
 
-void draw_cog_icon(std::vector<unsigned char>& buffer,
+void draw_cog_icon(RenderBuffer& buffer,
                    int width,
                    int height,
                    const Rect& rect,
-                   unsigned char value) {
+                   Color value) {
     const int cx = rect.x + (rect.width / 2);
     const int cy = rect.y + (rect.height / 2);
     const int inner = std::max(8, std::min(rect.width, rect.height) / 5);
@@ -99,19 +99,19 @@ void draw_cog_icon(std::vector<unsigned char>& buffer,
 
     draw_arc(buffer, width, height, cx, cy, inner + 4, 0.0, kPi * 2.0, 3, value);
     fill_rect(buffer, width, height, {cx - inner, cy - inner, inner * 2, inner * 2}, value);
-    fill_rect(buffer, width, height, {cx - 5, cy - 5, 10, 10}, kWhite);
+    fill_rect(buffer, width, height, {cx - 5, cy - 5, 10, 10}, active_theme().white);
 }
 
-void draw_wifi_icon(std::vector<unsigned char>& buffer,
+void draw_wifi_icon(RenderBuffer& buffer,
                     int width,
                     int height,
                     const Rect& rect,
                     bool connected,
-                    unsigned char value,
-                    unsigned char muted) {
+                    Color value,
+                    Color muted) {
     const int cx = rect.x + (rect.width / 2);
     const int cy = rect.y + rect.height - 14;
-    const unsigned char stroke = connected ? value : muted;
+    const Color stroke = connected ? value : muted;
     draw_arc(buffer, width, height, cx, cy, 10, kPi * 1.14, kPi * 1.86, 3, stroke);
     draw_arc(buffer, width, height, cx, cy, 19, kPi * 1.14, kPi * 1.86, 3, stroke);
     draw_arc(buffer, width, height, cx, cy, 28, kPi * 1.14, kPi * 1.86, 3, stroke);
@@ -121,14 +121,14 @@ void draw_wifi_icon(std::vector<unsigned char>& buffer,
     }
 }
 
-void draw_cloud_icon(std::vector<unsigned char>& buffer,
+void draw_cloud_icon(RenderBuffer& buffer,
                      int width,
                      int height,
                      const Rect& rect,
                      bool rainy,
-                     unsigned char value,
-                     unsigned char muted) {
-    const unsigned char stroke = rainy ? muted : value;
+                     Color value,
+                     Color muted) {
+    const Color stroke = rainy ? muted : value;
     fill_rect(buffer, width, height, {rect.x + 12, rect.y + 26, rect.width - 24, 12}, stroke);
     fill_rect(buffer, width, height, {rect.x + 8, rect.y + 20, 18, 18}, stroke);
     fill_rect(buffer, width, height, {rect.x + 24, rect.y + 12, 22, 22}, stroke);
@@ -140,16 +140,16 @@ void draw_cloud_icon(std::vector<unsigned char>& buffer,
     }
 }
 
-void draw_battery_icon(std::vector<unsigned char>& buffer,
+void draw_battery_icon(RenderBuffer& buffer,
                        int width,
                        int height,
                        const Rect& rect,
                        int percent,
                        bool charging,
                        bool available,
-                       unsigned char value,
-                       unsigned char muted) {
-    const unsigned char stroke = available ? value : muted;
+                       Color value,
+                       Color muted) {
+    const Color stroke = available ? value : muted;
     const int plug_width = charging ? 22 : 0;
     const Rect battery{
         rect.x + 8 + plug_width,
