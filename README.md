@@ -1,55 +1,97 @@
 # hadisplay
 
-Kobo e-ink display for Home Assistant, built with C++ and FBInk.
+`hadisplay` is a native Kobo framebuffer app for controlling Home Assistant from an e-ink touchscreen.
 
-Renders a touch UI on the Kobo Clara Colour's e-ink screen and calls the Home Assistant REST API when buttons are tapped. Runs as a standalone app that replaces Nickel (Kobo stock software) while active, then returns to Nickel on exit.
+It runs as a standalone app on the Kobo, takes over the screen while active, and returns to Nickel when it exits. The current UI includes a top status bar plus a Home Assistant dashboard for lights, switches, and climate devices.
 
-## Targets
+## Status
 
-| Target | Description |
-|---|---|
-| **`hadisplay`** | Main application. Persistent event loop with FBInk rendering, touch input, and HA integration. Deployed to the Kobo. |
-| **`hello_fbink_linuxfb`** | FBInk smoke test. Prints text to the framebuffer and exits after 5 seconds. Validates display access. |
-| **`hello_fbink_mirror_x11`** | Local dev preview. Renders the scene through FBInk on a host Linux framebuffer and mirrors it into an X11 window. Requires a real `/dev/fb0`. |
+- Only tested on the **Kobo Clara Colour N367B**.
+- It will likely **not** work on other Kobo models without additional development work.
+- Current device assumptions include Clara Colour framebuffer behavior, touch mapping, and backlight/status paths.
+
+## Current features
+
+- Top status bar with:
+  - time and date
+  - weather from Home Assistant
+  - Wi-Fi status
+  - battery status
+  - backlight toggle
+- Setup flow for selecting which Home Assistant entities appear on the dashboard
+- Dashboard cards for:
+  - `light.*`
+  - `switch.*`
+  - `climate.*`
+- Light detail view with:
+  - on/off
+  - brightness `+/-`
+  - RGB preset buttons
+  - white preset buttons
+- Climate detail view with:
+  - current and target temperature
+  - heating state
+  - heat on/off control
+- Config persisted to JSON on the device
+
+## Kobo requirements
+
+The Kobo needs these components installed:
+
+- **NickelMenu**
+- **KOReader**
+- **Kobo Stuff**
+
+Notes:
+
+- NickelMenu is used to launch `hadisplay`.
+- KOReader is part of the tested Kobo setup and should already be installed on the device.
+- Kobo Stuff provides the SSH, `rsync`, and shared library environment this project currently relies on.
 
 ## Project layout
 
-```
+```text
 src/
-  app/               main hadisplay application (touch + HA)
+  app/
     main.cpp
-  common/            shared code (UI renderer, HA client)
+  common/
+    app_config.{h,cpp}
     ha_client.{h,cpp}
+    json.{h,cpp}
     scene.{h,cpp}
-  fbink_smoke/       FBInk smoke test entry point
+    scene_draw.{h,cpp}
+    scene_icons.{h,cpp}
+    scene_layout.{h,cpp}
+    scene_style.h
+    system_status.{h,cpp}
+  fbink_smoke/
     main.cpp
-  fbink_mirror/      FBInk-to-X11 mirror entry point
+  fbink_mirror/
     main.cpp
 cmake/
   toolchains/
-    kobo.cmake       cross-compile toolchain for Kobo ARM
-  curl/              vendored curl headers (ABI-stable, for cross-compile)
-  kobo-libs/         libcurl.so copied from Kobo (for linking)
+    kobo.cmake
+  curl/
+  kobo-libs/
 scripts/
-  deploy.sh          build, rsync to Kobo, restart on device
-  run-hadisplay.sh   on-device launcher (kills Nickel, runs app, restarts Nickel)
+  deploy.sh
+  run-hadisplay.sh
 docs/
-  kobo-setup.md      device setup, SSH, deployment reference
-archive/             development log and old artifacts (gitignored)
+  kobo-setup.md
 ```
 
-## Quick start
+## Building
 
-### Host build (all targets)
+### Host build
 
 ```bash
 cmake -S . -B build -DHADISPLAY_FETCH_FBINK=ON
 cmake --build build -j
 ```
 
-### Cross-compile for Kobo
+### Kobo cross-build
 
-Requires the KOReader koxtoolchain (`arm-kobo-linux-gnueabihf-gcc` in PATH).
+Requires the KOReader `koxtoolchain` with `arm-kobo-linux-gnueabihf-gcc` available in `PATH`.
 
 ```bash
 cmake -S . -B build-kobo \
@@ -58,95 +100,105 @@ cmake -S . -B build-kobo \
 cmake --build build-kobo -j
 ```
 
-### Deploy to Kobo
+## Deploying
 
 ```bash
 ./scripts/deploy.sh
 ```
 
-This builds, rsyncs the binary to `/mnt/onboard/.adds/hadisplay/`, kills any running instance, and restarts it. Requires `ssh kobo` to be configured.
-It also syncs `run-hadisplay.sh` and starts the app through that launcher so exiting the app returns to Nickel correctly.
+This will:
+
+- build the Kobo target
+- copy `hadisplay` and `run-hadisplay.sh` to `/mnt/onboard/.adds/hadisplay/`
+- restart the app on the device
+- tail the device log
+
+It expects `ssh kobo` to be configured.
 
 ## Home Assistant configuration
 
-The easiest option is to edit `hadisplay-config.json` in the hadisplay directory on the Kobo (`/mnt/onboard/.adds/hadisplay/hadisplay-config.json`):
+Configuration lives in:
+
+`/mnt/onboard/.adds/hadisplay/hadisplay-config.json`
+
+Example:
 
 ```json
 {
   "ha_url": "http://your-ha-instance:8123",
   "ha_token": "your_long_lived_access_token",
   "ha_weather_entity": "weather.forecast_home",
-  "selected_light_ids": []
+  "selected_entity_ids": [
+    "light.kitchen",
+    "switch.lamp_socket",
+    "climate.hallway"
+  ]
 }
 ```
 
-The app loads that JSON on startup and preserves those keys when it saves dashboard selections.
+Behavior:
+
+- `ha_url`, `ha_token`, and `ha_weather_entity` are loaded at startup
+- selected dashboard entities are persisted back into the same file
+- if no config exists, the app can enumerate Home Assistant entities and let the user select what should appear on the dashboard
 
 `.env` is still supported as a fallback:
 
-```
+```text
 HA_URL=http://your-ha-instance:8123
 HA_TOKEN=your_long_lived_access_token
 ```
 
-If `ha_url` or `ha_token` are missing from the JSON config, the app searches for `.env` relative to its working directory and executable path.
-
-Current Clara Colour behavior:
-- the dashboard is built from selected `light.*` entities from Home Assistant
-- the detail view exposes brightness, RGB presets, and white presets where supported
-- `EXIT` leaves hadisplay and returns to Nickel
+If `ha_url` or `ha_token` are missing from the JSON config, the app falls back to `.env`.
 
 ## Running on the Kobo
 
-### Via NickelMenu
+### NickelMenu entry
 
-Add a launcher entry at `/mnt/onboard/.adds/nm/hadisplay`:
+Create a launcher entry in `/mnt/onboard/.adds/nm/hadisplay`:
 
-```
+```text
 menu_item:main:Hadisplay:cmd_spawn:quiet:exec /bin/sh /mnt/onboard/.adds/hadisplay/run-hadisplay.sh
 ```
 
-The launcher script (`run-hadisplay.sh`) handles the full lifecycle:
-1. Captures Nickel's environment (WiFi, dbus).
-2. Kills Nickel and its helper processes.
-3. Runs hadisplay with exclusive touch access.
-4. Restarts Nickel on exit with Kobo's library path restored.
+`run-hadisplay.sh`:
 
-### Via SSH (manual)
+- captures the required Nickel environment
+- stops Nickel and helper processes
+- launches `hadisplay`
+- restarts Nickel when `hadisplay` exits
+
+### Manual SSH launch
 
 ```bash
 ssh kobo
 cd /mnt/onboard/.adds/hadisplay
-killall nickel hindenburg sickel fickel strickel fontickel 2>/dev/null
 LD_LIBRARY_PATH=/mnt/onboard/.niluje/usbnet/lib ./hadisplay
 ```
 
-Directly launching `./hadisplay` this way does not restart Nickel when the app exits. For normal device use, prefer `run-hadisplay.sh` or the NickelMenu entry above.
+Manual launch is useful for debugging, but it does not provide the normal Nickel lifecycle handling. For normal use, prefer the NickelMenu launcher.
 
-## Device details
+## Device notes
 
-- **Device**: Kobo Clara Colour (device code 393), firmware 4.45.23646
-- **Screen**: 1072x1448 portrait, framebuffer rotation=3
-- **Touch**: Cypress cyttsp5_mt at `/dev/input/event1`, range X:0-1447, Y:0-1071
-- **Touch mapping**: axes swapped + X inverted due to rotation=3
-- **Current UI**: full-screen Clara-specific layout with live light state, sync, full refresh, and exit actions
-- **Dependencies on device**: Kobo Stuff (SSH, rsync, libcurl), NickelMenu (launcher)
-- **WiFi**: `ForceWifi=true` in `[DeveloperSettings]` keeps WiFi alive
+- Tested device: **Kobo Clara Colour N367B** / device code `393`
+- Screen: `1072x1448`
+- Wi-Fi and some runtime libraries depend on the Kobo environment inherited from Nickel and Kobo Stuff
+- `ForceWifi=true` in `[DeveloperSettings]` is still useful for keeping Wi-Fi alive
 
-## Kobo deployment reference
+## Related docs
 
-See [docs/kobo-setup.md](docs/kobo-setup.md) for the full device setup, SSH auth, and deployment details.
+For the fuller Kobo setup and SSH/deploy notes, see [docs/kobo-setup.md](docs/kobo-setup.md).
 
 ## Build options
 
 | Option | Default | Description |
 |---|---|---|
-| `HADISPLAY_FETCH_FBINK` | `ON` | Fetch and build FBInk via ExternalProject |
+| `HADISPLAY_FETCH_FBINK` | `ON` | Fetch and build FBInk automatically |
 | `HADISPLAY_BUILD_APP` | `ON` | Build the main `hadisplay` application |
-| `HADISPLAY_BUILD_FBINK_SMOKE` | `ON` | Build the `hello_fbink_linuxfb` smoke test |
-| `HADISPLAY_BUILD_FBINK_MIRROR_X11` | `ON` | Build the `hello_fbink_mirror_x11` dev preview |
+| `HADISPLAY_BUILD_FBINK_SMOKE` | `ON` | Build the framebuffer smoke target |
+| `HADISPLAY_BUILD_FBINK_MIRROR_X11` | `ON` | Build the X11 mirror target |
 
-The X11 mirror requires `libX11` and `libcurl` on the host. Disable it for cross-compilation:
+The X11 mirror requires `libX11` and `libcurl` on the host. Disable it when cross-compiling if you do not need it:
 
 ```bash
 -DHADISPLAY_BUILD_FBINK_MIRROR_X11=OFF
