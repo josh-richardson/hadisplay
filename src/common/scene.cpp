@@ -6,6 +6,9 @@
 #include "scene_style.h"
 
 #include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -319,6 +322,7 @@ void draw_top_bar(RenderBuffer& buffer,
                           layout.wifi_button,
                           state.wifi_connected,
                           buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_blue : kWhite,
+                          buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_red : kMid,
                           kMid);
 
     scene::draw_battery_icon(buffer,
@@ -349,12 +353,24 @@ std::string setup_summary(const EntityItem& entity) {
         }
     } else if (entity.kind == EntityKind::Switch) {
         summary += " SOCKET";
-    } else {
+    } else if (entity.kind == EntityKind::Climate) {
         if (entity.target_temperature > 0) {
             summary += " SET " + std::to_string(entity.target_temperature) + "C";
         }
         if (!entity.hvac_action.empty()) {
             summary += " " + scene::uppercase_ascii(entity.hvac_action);
+        }
+    } else {
+        if (!entity.device_class.empty()) {
+            summary = entity.device_class;
+            std::replace(summary.begin(), summary.end(), '_', ' ');
+            summary = scene::uppercase_ascii(summary);
+        }
+        if (!entity.unit_label.empty()) {
+            summary += " " + entity.unit_label;
+        }
+        if (entity.supports_history) {
+            summary += " GRAPH";
         }
     }
     return summary;
@@ -366,6 +382,15 @@ std::string dashboard_detail(const EntityItem& entity) {
     }
     if (entity.kind == EntityKind::Switch) {
         return "TAP TO TOGGLE";
+    }
+    if (entity.kind == EntityKind::Sensor) {
+        std::string detail = entity.device_class.empty() ? "SENSOR" : entity.device_class;
+        std::replace(detail.begin(), detail.end(), '_', ' ');
+        detail = scene::uppercase_ascii(detail);
+        if (!entity.unit_label.empty()) {
+            detail += " " + entity.unit_label;
+        }
+        return detail;
     }
 
     std::string detail;
@@ -382,7 +407,161 @@ std::string dashboard_detail(const EntityItem& entity) {
 }
 
 bool entity_supports_dashboard_detail(const EntityItem& entity) {
-    return entity.supports_detail;
+    return entity.kind == EntityKind::Sensor || entity.supports_detail;
+}
+
+std::string format_metric_value(double value) {
+    std::ostringstream stream;
+    const double rounded = std::round(value);
+    if (std::fabs(value - rounded) < 0.05) {
+        stream << static_cast<long long>(rounded);
+    } else if (std::fabs(value) >= 100.0) {
+        stream << std::fixed << std::setprecision(0) << value;
+    } else if (std::fabs(value) >= 10.0) {
+        stream << std::fixed << std::setprecision(1) << value;
+    } else {
+        stream << std::fixed << std::setprecision(2) << value;
+    }
+    return stream.str();
+}
+
+void draw_sensor_history_graph(RenderBuffer& buffer,
+                               int width,
+                               int height,
+                               const Rect& bounds,
+                               const SceneState& state,
+                               const EntityItem& entity) {
+    scene::fill_rect(buffer, width, height, bounds, kWhite);
+    scene::draw_rect_thick(buffer, width, height, bounds, 2, kDark);
+    scene::draw_text(buffer, width, height, bounds.x + 18, bounds.y + 18, "24H HISTORY", 3, kDark);
+
+    if (state.detail_history_loading && state.detail_history_entity_id == entity.entity_id) {
+        scene::draw_text_centered(buffer,
+                                  width,
+                                  height,
+                                  bounds,
+                                  bounds.y + (bounds.height / 2) - 12,
+                                  "LOADING HISTORY",
+                                  3,
+                                  kMid);
+        return;
+    }
+
+    if (!state.detail_history_available ||
+        state.detail_history_entity_id != entity.entity_id ||
+        state.detail_history_values.size() < 2) {
+        scene::draw_text_centered(buffer,
+                                  width,
+                                  height,
+                                  bounds,
+                                  bounds.y + (bounds.height / 2) - 12,
+                                  "NO HISTORY",
+                                  3,
+                                  kMid);
+        return;
+    }
+
+    const std::string unit_suffix = entity.unit_label.empty() ? "" : (" " + entity.unit_label);
+    const std::string current_label = "NOW " + format_metric_value(state.detail_history_values.back()) + unit_suffix;
+    scene::draw_text(buffer,
+                     width,
+                     height,
+                     bounds.x + bounds.width - 240,
+                     bounds.y + 18,
+                     scene::fit_text_to_width(current_label, 2, 220),
+                     2,
+                     kDark);
+
+    constexpr int kAxisLabelWidth = 84;
+    constexpr int kBottomLabelHeight = 42;
+    const Rect plot{
+        bounds.x + 18 + kAxisLabelWidth,
+        bounds.y + 56,
+        bounds.width - 36 - kAxisLabelWidth,
+        bounds.height - 84 - kBottomLabelHeight,
+    };
+    scene::fill_rect(buffer, width, height, plot, kWhite);
+    scene::draw_rect_thick(buffer, width, height, plot, 2, kMid);
+
+    const auto& values = state.detail_history_values;
+    const double min_value = state.detail_history_min;
+    const double max_value = state.detail_history_max;
+    const double span = std::max(0.001, max_value - min_value);
+    const double mid_value = min_value + (span * 0.5);
+    const int drawable_width = std::max(1, plot.width - 12);
+    const Color graph_color = buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_blue : kDark;
+
+    auto y_for_value = [&](double value) {
+        const double normalized = (value - min_value) / span;
+        const double clamped = std::clamp(normalized, 0.0, 1.0);
+        return plot.y + plot.height - 8 - static_cast<int>(std::lround(clamped * static_cast<double>(plot.height - 16)));
+    };
+
+    const int top_y = y_for_value(max_value);
+    const int mid_y = y_for_value(mid_value);
+    const int bottom_y = y_for_value(min_value);
+    scene::draw_line(buffer, width, height, plot.x + 1, top_y, plot.x + plot.width - 2, top_y, 1, kLight);
+    scene::draw_line(buffer, width, height, plot.x + 1, mid_y, plot.x + plot.width - 2, mid_y, 1, kLight);
+    scene::draw_line(buffer, width, height, plot.x + 1, bottom_y, plot.x + plot.width - 2, bottom_y, 1, kLight);
+
+    int prev_x = plot.x + 6;
+    int prev_y = y_for_value(values.front());
+    for (int x = 1; x < drawable_width; ++x) {
+        const std::size_t index = static_cast<std::size_t>((static_cast<long long>(x) * static_cast<long long>(values.size() - 1)) /
+                                                           std::max<long long>(1, drawable_width - 1));
+        const int draw_x = plot.x + 6 + x;
+        const int draw_y = y_for_value(values[index]);
+        scene::draw_line(buffer, width, height, prev_x, prev_y, draw_x, draw_y, 2, graph_color);
+        prev_x = draw_x;
+        prev_y = draw_y;
+    }
+
+    const Rect y_axis{
+        bounds.x + 14,
+        plot.y,
+        kAxisLabelWidth - 12,
+        plot.height,
+    };
+    const auto draw_right_aligned_label = [&](int y, const std::string& label, Color color) {
+        const std::string fitted = scene::fit_text_to_width(label, 2, y_axis.width);
+        const int x = y_axis.x + std::max(0, y_axis.width - scene::text_width(fitted, 2));
+        scene::draw_text(buffer, width, height, x, y, fitted, 2, color);
+    };
+    draw_right_aligned_label(y_axis.y + 8, format_metric_value(max_value) + unit_suffix, kMid);
+    draw_right_aligned_label(y_axis.y + (y_axis.height / 2) + 6, format_metric_value(mid_value) + unit_suffix, kMid);
+    draw_right_aligned_label(y_axis.y + y_axis.height - 10, format_metric_value(min_value) + unit_suffix, kMid);
+
+    const Rect x_axis{
+        plot.x,
+        plot.y + plot.height + 10,
+        plot.width,
+        kBottomLabelHeight,
+    };
+    scene::draw_text(buffer,
+                     width,
+                     height,
+                     x_axis.x,
+                     x_axis.y + 18,
+                     "24H AGO",
+                     2,
+                     kMid);
+    scene::draw_text_centered(buffer,
+                              width,
+                              height,
+                              x_axis,
+                              x_axis.y + 18,
+                              "12H",
+                              2,
+                              kMid);
+    const std::string now_label = "NOW";
+    scene::draw_text(buffer,
+                     width,
+                     height,
+                     x_axis.x + std::max(0, x_axis.width - scene::text_width(now_label, 2)),
+                     x_axis.y + 18,
+                     now_label,
+                     2,
+                     kMid);
 }
 
 void draw_setup_view(RenderBuffer& buffer,
@@ -513,8 +692,9 @@ void draw_dashboard_view(RenderBuffer& buffer,
         int detail_button_index = -1;
         find_button(buttons, ButtonId::DashboardToggleLight, entity_index, &toggle_button_index);
         const Button* detail_button = find_button(buttons, ButtonId::DashboardOpenDetail, entity_index, &detail_button_index);
-        const bool pressed = toggle_button_index == state.pressed_button;
-        const bool selected_card = toggle_button_index == state.selected_button;
+        const int primary_button_index = toggle_button_index >= 0 ? toggle_button_index : detail_button_index;
+        const bool pressed = primary_button_index == state.pressed_button;
+        const bool selected_card = primary_button_index == state.selected_button;
         draw_button_frame(buffer, state.width, state.height, card, pressed, selected_card);
 
         scene::draw_text(buffer,
@@ -552,6 +732,15 @@ void draw_dashboard_view(RenderBuffer& buffer,
                              scene::fit_text_to_width(scene::uppercase_ascii(entity.hvac_action), 2, card.width - 110),
                              2,
                              pressed ? kLight : kDark);
+        } else if (entity.kind == EntityKind::Sensor && !entity.unit_label.empty()) {
+            scene::draw_text(buffer,
+                             state.width,
+                             state.height,
+                             card.x + 18,
+                             card.y + 134,
+                             scene::fit_text_to_width(scene::uppercase_ascii(entity.unit_label), 2, card.width - 110),
+                             2,
+                             pressed ? kLight : kDark);
         }
 
         scene::draw_text(buffer,
@@ -563,7 +752,12 @@ void draw_dashboard_view(RenderBuffer& buffer,
                          2,
                          pressed ? kLight : kMid);
 
-        if (detail_button != nullptr && entity_supports_dashboard_detail(entity)) {
+        if (detail_button != nullptr &&
+            entity_supports_dashboard_detail(entity) &&
+            !(detail_button->rect.x == card.x &&
+              detail_button->rect.y == card.y &&
+              detail_button->rect.width == card.width &&
+              detail_button->rect.height == card.height)) {
             const bool detail_pressed = detail_button_index == state.pressed_button;
             const bool detail_selected = detail_button_index == state.selected_button;
             draw_text_button(buffer,
@@ -660,7 +854,11 @@ void draw_detail_view(RenderBuffer& buffer,
     };
     Color summary_fill = kLight;
     if (buffer.format == PixelFormat::RGBA32) {
-        summary_fill = entity.kind == EntityKind::Climate ? scene::active_theme().highlight : scene::active_theme().warning;
+        if (entity.kind == EntityKind::Climate || entity.kind == EntityKind::Sensor) {
+            summary_fill = scene::active_theme().highlight;
+        } else {
+            summary_fill = scene::active_theme().warning;
+        }
     }
     scene::fill_rect(buffer, state.width, state.height, summary, summary_fill);
     scene::draw_rect_thick(buffer, state.width, state.height, summary, 2, kDark);
@@ -673,6 +871,13 @@ void draw_detail_view(RenderBuffer& buffer,
         summary_detail = "NOW " + std::to_string(entity.current_temperature) + "C SET " + std::to_string(entity.target_temperature) + "C";
         if (!entity.hvac_action.empty()) {
             summary_detail += " " + scene::uppercase_ascii(entity.hvac_action);
+        }
+    } else if (entity.kind == EntityKind::Sensor) {
+        summary_detail = entity.device_class.empty() ? "SENSOR" : entity.device_class;
+        std::replace(summary_detail.begin(), summary_detail.end(), '_', ' ');
+        summary_detail = scene::uppercase_ascii(summary_detail);
+        if (!entity.unit_label.empty()) {
+            summary_detail += " " + entity.unit_label;
         }
     } else {
         summary_detail = scene::uppercase_ascii(entity.kind_label);
@@ -774,6 +979,16 @@ void draw_detail_view(RenderBuffer& buffer,
         return;
     }
 
+    if (entity.kind == EntityKind::Sensor) {
+        draw_sensor_history_graph(buffer,
+                                  state.width,
+                                  state.height,
+                                  {layout.body.x, layout.body.y + 248, layout.body.width, layout.body.height - 248},
+                                  state,
+                                  entity);
+        return;
+    }
+
     scene::draw_text_centered(buffer,
                               state.width,
                               state.height,
@@ -860,6 +1075,15 @@ std::vector<Button> buttons_for(const SceneState& state) {
             const int entity_index = selected[static_cast<std::size_t>(start + i)];
             const EntityItem& entity = state.entities[static_cast<std::size_t>(entity_index)];
             const Rect card = scene::grid_cell(layout.body, 2, 3, i % 2, i / 2, gutter);
+            if (entity.kind == EntityKind::Sensor && entity_supports_dashboard_detail(entity)) {
+                buttons.push_back({
+                    .id = ButtonId::DashboardOpenDetail,
+                    .label = entity.name,
+                    .rect = card,
+                    .value = entity_index,
+                });
+                continue;
+            }
             if (entity_supports_dashboard_detail(entity)) {
                 buttons.push_back({
                     .id = ButtonId::DashboardOpenDetail,
@@ -883,21 +1107,22 @@ std::vector<Button> buttons_for(const SceneState& state) {
         return buttons;
     }
 
-    const Rect toggle_rect{
-        layout.body.x,
-        layout.body.y + 178,
-        layout.body.width,
-        52,
-    };
-    buttons.push_back({
-        .id = ButtonId::DetailToggleLight,
-        .label = "TOGGLE",
-        .rect = toggle_rect,
-        .value = state.detail_entity_index,
-    });
-
     if (state.detail_entity_index >= 0 && state.detail_entity_index < static_cast<int>(state.entities.size())) {
         const EntityItem& entity = state.entities[static_cast<std::size_t>(state.detail_entity_index)];
+        if (entity.kind == EntityKind::Light || entity.kind == EntityKind::Climate) {
+            const Rect toggle_rect{
+                layout.body.x,
+                layout.body.y + 178,
+                layout.body.width,
+                52,
+            };
+            buttons.push_back({
+                .id = ButtonId::DetailToggleLight,
+                .label = "TOGGLE",
+                .rect = toggle_rect,
+                .value = state.detail_entity_index,
+            });
+        }
         if (entity.kind == EntityKind::Light) {
             if (entity.supports_brightness) {
                 const Rect base{layout.body.x, layout.body.y + 248, layout.body.width, 86};

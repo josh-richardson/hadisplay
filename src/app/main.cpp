@@ -78,6 +78,11 @@ struct WeatherRefreshCompletion {
     ha::WeatherState weather;
 };
 
+struct SensorHistoryCompletion {
+    std::uint64_t epoch = 0;
+    ha::SensorHistoryResult history;
+};
+
 enum class EntityActionType {
     ToggleLight = 0,
     ToggleSwitch,
@@ -105,11 +110,13 @@ struct EntityActionCompletion {
     std::string success_status = "ENTITY UPDATED";
 };
 
-using AsyncCompletion = std::variant<EntityRefreshCompletion, WeatherRefreshCompletion, EntityActionCompletion>;
+using AsyncCompletion = std::variant<EntityRefreshCompletion, WeatherRefreshCompletion, EntityActionCompletion, SensorHistoryCompletion>;
 
 struct AsyncMailbox {
     std::mutex mutex;
     std::vector<AsyncCompletion> completions;
+    int wake_read_fd = -1;
+    int wake_write_fd = -1;
 };
 
 struct AsyncState {
@@ -117,10 +124,14 @@ struct AsyncState {
     bool entity_refresh_pending = false;
     bool weather_refresh_pending = false;
     bool entity_action_pending = false;
+    bool sensor_history_pending = false;
     std::uint64_t next_entity_epoch = 0;
     std::uint64_t latest_entity_applied_epoch = 0;
     std::uint64_t next_weather_epoch = 0;
     std::uint64_t latest_weather_applied_epoch = 0;
+    std::uint64_t next_history_epoch = 0;
+    std::uint64_t pending_history_epoch = 0;
+    std::uint64_t latest_history_applied_epoch = 0;
 };
 
 std::string uppercase_ascii(std::string value) {
@@ -229,6 +240,11 @@ bool update_weather_state(hadisplay::SceneState& scene_state, const ha::WeatherS
 void post_async_completion(const std::shared_ptr<AsyncMailbox>& mailbox, AsyncCompletion completion) {
     std::lock_guard<std::mutex> lock(mailbox->mutex);
     mailbox->completions.push_back(std::move(completion));
+    if (mailbox->wake_write_fd >= 0) {
+        const std::uint8_t signal = 1U;
+        const ssize_t written = write(mailbox->wake_write_fd, &signal, sizeof(signal));
+        (void)written;
+    }
 }
 
 std::vector<AsyncCompletion> take_async_completions(AsyncState& async_state) {
@@ -236,6 +252,56 @@ std::vector<AsyncCompletion> take_async_completions(AsyncState& async_state) {
     std::vector<AsyncCompletion> completions;
     completions.swap(async_state.mailbox->completions);
     return completions;
+}
+
+void drain_async_wake_fd(const AsyncMailbox& mailbox) {
+    if (mailbox.wake_read_fd < 0) {
+        return;
+    }
+
+    std::array<std::uint8_t, 64> buffer{};
+    while (read(mailbox.wake_read_fd, buffer.data(), buffer.size()) > 0) {
+    }
+}
+
+bool configure_async_mailbox(AsyncState& async_state) {
+    int pipe_fds[2]{-1, -1};
+    if (pipe(pipe_fds) < 0) {
+        std::cerr << "Failed to create async wake pipe: " << std::strerror(errno) << "\n";
+        return false;
+    }
+
+    for (int fd : pipe_fds) {
+        const int current_flags = fcntl(fd, F_GETFL, 0);
+        if (current_flags < 0 || fcntl(fd, F_SETFL, current_flags | O_NONBLOCK) < 0) {
+            std::cerr << "Failed to set async wake pipe nonblocking: " << std::strerror(errno) << "\n";
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            return false;
+        }
+        const int current_fd_flags = fcntl(fd, F_GETFD, 0);
+        if (current_fd_flags < 0 || fcntl(fd, F_SETFD, current_fd_flags | FD_CLOEXEC) < 0) {
+            std::cerr << "Failed to set async wake pipe cloexec: " << std::strerror(errno) << "\n";
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            return false;
+        }
+    }
+
+    async_state.mailbox->wake_read_fd = pipe_fds[0];
+    async_state.mailbox->wake_write_fd = pipe_fds[1];
+    return true;
+}
+
+void close_async_mailbox(AsyncState& async_state) {
+    if (async_state.mailbox->wake_read_fd >= 0) {
+        close(async_state.mailbox->wake_read_fd);
+        async_state.mailbox->wake_read_fd = -1;
+    }
+    if (async_state.mailbox->wake_write_fd >= 0) {
+        close(async_state.mailbox->wake_write_fd);
+        async_state.mailbox->wake_write_fd = -1;
+    }
 }
 
 void signal_handler(int) {
@@ -272,6 +338,20 @@ std::string concise_ha_error(const std::string& message) {
     return "HA REQUEST FAILED";
 }
 
+std::string concise_history_error(const std::string& message) {
+    const std::string lower = [] (std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    }(message);
+
+    if (lower.find("no history") != std::string::npos || lower.find("no numeric") != std::string::npos) {
+        return "NO HISTORY";
+    }
+    return concise_ha_error(message);
+}
+
 std::string state_label_from_text(const std::string& state) {
     if (state == "on") {
         return "ON";
@@ -293,6 +373,7 @@ hadisplay::EntityKind scene_entity_kind(ha::EntityKind kind) {
         case ha::EntityKind::Light: return hadisplay::EntityKind::Light;
         case ha::EntityKind::Switch: return hadisplay::EntityKind::Switch;
         case ha::EntityKind::Climate: return hadisplay::EntityKind::Climate;
+        case ha::EntityKind::Sensor: return hadisplay::EntityKind::Sensor;
     }
     return hadisplay::EntityKind::Light;
 }
@@ -302,6 +383,7 @@ std::string entity_kind_label(hadisplay::EntityKind kind) {
         case hadisplay::EntityKind::Light: return "LIGHT";
         case hadisplay::EntityKind::Switch: return "SOCKET";
         case hadisplay::EntityKind::Climate: return "THERMOSTAT";
+        case hadisplay::EntityKind::Sensor: return "SENSOR";
     }
     return "DEVICE";
 }
@@ -346,8 +428,22 @@ hadisplay::EntityItem entity_item_from_state(const ha::EntityState& entity, bool
     item.rgb_blue = entity.rgb_blue;
     item.current_temperature = entity.current_temperature;
     item.target_temperature = entity.target_temperature;
+    item.supports_history = entity.kind == ha::EntityKind::Sensor;
+    item.has_numeric_value = entity.has_numeric_value;
+    item.numeric_value = entity.numeric_value;
+    item.device_class = entity.device_class;
+    item.unit_label = entity.unit_of_measurement;
     item.hvac_action = entity.hvac_action;
     return item;
+}
+
+void clear_detail_history(hadisplay::SceneState& scene_state) {
+    scene_state.detail_history_entity_id.clear();
+    scene_state.detail_history_loading = false;
+    scene_state.detail_history_available = false;
+    scene_state.detail_history_values.clear();
+    scene_state.detail_history_min = 0.0;
+    scene_state.detail_history_max = 0.0;
 }
 
 std::optional<int> find_entity_index(const hadisplay::SceneState& scene_state, const std::string& entity_id) {
@@ -403,6 +499,12 @@ void populate_entities(hadisplay::SceneState& scene_state,
         scene_state.detail_entity_index = detail_index.value_or(-1);
     } else {
         scene_state.detail_entity_index = -1;
+    }
+
+    if (scene_state.detail_entity_index < 0 ||
+        scene_state.entities[static_cast<std::size_t>(scene_state.detail_entity_index)].kind != hadisplay::EntityKind::Sensor ||
+        scene_state.entities[static_cast<std::size_t>(scene_state.detail_entity_index)].entity_id != scene_state.detail_history_entity_id) {
+        clear_detail_history(scene_state);
     }
 }
 
@@ -471,6 +573,20 @@ void schedule_weather_refresh(AsyncState& async_state, const ha::Client& ha_clie
                               WeatherRefreshCompletion{
                                   .epoch = epoch,
                                   .weather = ha_client.fetch_weather_state(),
+                              });
+    }).detach();
+}
+
+void schedule_sensor_history(AsyncState& async_state, const ha::Client& ha_client, const std::string& entity_id) {
+    const std::uint64_t epoch = ++async_state.next_history_epoch;
+    async_state.sensor_history_pending = true;
+    async_state.pending_history_epoch = epoch;
+    const std::shared_ptr<AsyncMailbox> mailbox = async_state.mailbox;
+    std::thread([mailbox, ha_client, epoch, entity_id]() mutable {
+        post_async_completion(mailbox,
+                              SensorHistoryCompletion{
+                                  .epoch = epoch,
+                                  .history = ha_client.fetch_sensor_history(entity_id),
                               });
     }).detach();
 }
@@ -559,6 +675,37 @@ bool process_async_completions(AsyncState& async_state,
             if (update_weather_state(scene_state, weather.weather)) {
                 needs_redraw = true;
             }
+            continue;
+        }
+
+        if (std::holds_alternative<SensorHistoryCompletion>(completion)) {
+            SensorHistoryCompletion history = std::move(std::get<SensorHistoryCompletion>(completion));
+            if (history.epoch < async_state.latest_history_applied_epoch) {
+                continue;
+            }
+            async_state.latest_history_applied_epoch = history.epoch;
+            if (history.epoch == async_state.pending_history_epoch) {
+                async_state.sensor_history_pending = false;
+            }
+            if (history.history.entity_id != scene_state.detail_history_entity_id) {
+                continue;
+            }
+
+            scene_state.detail_history_loading = false;
+            if (!history.history.ok) {
+                scene_state.detail_history_available = false;
+                scene_state.detail_history_values.clear();
+                scene_state.status = concise_history_error(history.history.message);
+                needs_redraw = true;
+                continue;
+            }
+
+            scene_state.detail_history_available = true;
+            scene_state.detail_history_values = std::move(history.history.values);
+            scene_state.detail_history_min = history.history.min_value;
+            scene_state.detail_history_max = history.history.max_value;
+            scene_state.status = "DETAIL VIEW";
+            needs_redraw = true;
             continue;
         }
 
@@ -779,7 +926,20 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
         case hadisplay::ButtonId::DashboardOpenDetail:
             scene_state.detail_entity_index = action_button.value;
             scene_state.view_mode = hadisplay::ViewMode::Detail;
-            scene_state.status = "DETAIL VIEW";
+            clear_detail_history(scene_state);
+            if (action_button.value >= 0 && action_button.value < static_cast<int>(scene_state.entities.size())) {
+                const hadisplay::EntityItem& entity = scene_state.entities[static_cast<std::size_t>(action_button.value)];
+                if (entity.kind == hadisplay::EntityKind::Sensor && entity.supports_history && ha_client.configured()) {
+                    scene_state.detail_history_entity_id = entity.entity_id;
+                    scene_state.detail_history_loading = true;
+                    scene_state.status = "LOADING HISTORY";
+                    schedule_sensor_history(async_state, ha_client, entity.entity_id);
+                } else {
+                    scene_state.status = "DETAIL VIEW";
+                }
+            } else {
+                scene_state.status = "DETAIL VIEW";
+            }
             needs_redraw = true;
             return false;
         case hadisplay::ButtonId::DashboardPreviousPage:
@@ -792,6 +952,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             return false;
         case hadisplay::ButtonId::DashboardConfigure:
             scene_state.view_mode = hadisplay::ViewMode::Setup;
+            clear_detail_history(scene_state);
             scene_state.status = "SETUP VIEW";
             needs_redraw = true;
             return false;
@@ -806,6 +967,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             return false;
         case hadisplay::ButtonId::DetailBack:
             scene_state.view_mode = hadisplay::ViewMode::Dashboard;
+            clear_detail_history(scene_state);
             scene_state.status = "DASHBOARD";
             needs_redraw = true;
             return false;
@@ -967,6 +1129,7 @@ int main() {
         .weather_entity_id = config.ha_weather_entity,
     });
     AsyncState async_state;
+    configure_async_mailbox(async_state);
 
     if (ha_client.configured()) {
         if (has_selected_entities(config)) {
@@ -992,6 +1155,7 @@ int main() {
     const int touchfd = open(kTouchDevice, O_RDONLY | O_NONBLOCK);
     if (touchfd < 0) {
         std::cerr << "Failed to open " << kTouchDevice << ": " << std::strerror(errno) << "\n";
+        close_async_mailbox(async_state);
         fbink_close(fbfd);
         return EXIT_FAILURE;
     }
@@ -1009,6 +1173,7 @@ int main() {
     if (!render(fbfd, scene_state, buttons, display_settings, render_state, true)) {
         ioctl(touchfd, EVIOCGRAB, 0);
         close(touchfd);
+        close_async_mailbox(async_state);
         fbink_close(fbfd);
         return EXIT_FAILURE;
     }
@@ -1026,14 +1191,19 @@ int main() {
     auto next_device_refresh = now + kNormalDevicePollInterval;
     auto next_weather_refresh = now + kNormalWeatherPollInterval;
 
-    struct pollfd pfd{};
-    pfd.fd = touchfd;
-    pfd.events = POLLIN;
+    std::array<struct pollfd, 2> poll_fds{};
+    poll_fds[0].fd = touchfd;
+    poll_fds[0].events = POLLIN;
+    const nfds_t poll_fd_count = async_state.mailbox->wake_read_fd >= 0 ? 2U : 1U;
+    if (poll_fd_count == 2U) {
+        poll_fds[1].fd = async_state.mailbox->wake_read_fd;
+        poll_fds[1].events = POLLIN;
+    }
 
     while (g_running) {
         now = std::chrono::steady_clock::now();
-        const int ret = poll(&pfd,
-                             1,
+        const int ret = poll(poll_fds.data(),
+                             poll_fd_count,
                              poll_timeout_until(now,
                                                 render_state.last_full_refresh + kFullRefreshInterval,
                                                 next_clock_refresh,
@@ -1054,8 +1224,12 @@ int main() {
                 needs_redraw = true;
             }
         } else {
+            if (poll_fd_count == 2U && (poll_fds[1].revents & POLLIN) != 0) {
+                drain_async_wake_fd(*async_state.mailbox);
+            }
             struct input_event ev{};
-            while (read(touchfd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+            while ((poll_fds[0].revents & POLLIN) != 0 &&
+                   read(touchfd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
                 if (ev.type == EV_ABS) {
                     if (ev.code == ABS_MT_POSITION_X) {
                         touch.x = ev.value;
@@ -1117,8 +1291,12 @@ int main() {
             next_light_refresh = now + fast_or_light;
         }
         if (now >= next_device_refresh) {
-            if (update_system_status(scene_state, device_status.snapshot())) {
+            const hadisplay::SystemStatus sys_status = device_status.snapshot();
+            if (update_system_status(scene_state, sys_status)) {
                 needs_redraw = true;
+            }
+            if (!sys_status.wifi_connected) {
+                device_status.try_wifi_recovery();
             }
             next_device_refresh = now + fast_or_device;
         }
@@ -1183,6 +1361,7 @@ int main() {
     clear_screen(fbfd, true, display_settings);
     ioctl(touchfd, EVIOCGRAB, 0);
     close(touchfd);
+    close_async_mailbox(async_state);
     fbink_close(fbfd);
     std::cerr << "hadisplay exiting.\n";
     return EXIT_SUCCESS;

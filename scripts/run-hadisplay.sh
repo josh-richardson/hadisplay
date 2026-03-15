@@ -30,6 +30,38 @@ if pkill -0 nickel 2>/dev/null; then
     rm -f /tmp/nickel-hardware-status
 fi
 
+# Disable WiFi driver-level power save to prevent disconnects.
+WIFI_IFACE="${INTERFACE:-wlan0}"
+iw "$WIFI_IFACE" set power_save off 2>/dev/null || iwconfig "$WIFI_IFACE" power off 2>/dev/null
+
+# Background WiFi keepalive: pings the gateway every 60s to prevent
+# inactivity-based WiFi teardown, and attempts to reconnect if WiFi drops.
+wifi_keepalive() {
+    while true; do
+        sleep 60
+        # Check if the interface is still up.
+        if ! ip link show "$WIFI_IFACE" up 2>/dev/null | grep -q "state UP"; then
+            # Try to reload WiFi modules and reconnect.
+            if [ -n "${WIFI_MODULE}" ]; then
+                insmod "/drivers/${PLATFORM}/wifi/sdio_wifi_pwr.ko" 2>/dev/null
+                insmod "/drivers/${PLATFORM}/wifi/${WIFI_MODULE}" 2>/dev/null
+                sleep 2
+            fi
+            ifconfig "$WIFI_IFACE" up 2>/dev/null
+            wpa_cli -i "$WIFI_IFACE" reconnect 2>/dev/null
+            sleep 5
+            udhcpc -i "$WIFI_IFACE" -t 5 -q 2>/dev/null
+        fi
+        # Generate traffic to prevent inactivity timeout.
+        GATEWAY=$(ip route | awk '/default/ {print $3}' | head -1)
+        if [ -n "$GATEWAY" ]; then
+            ping -c 1 -W 5 "$GATEWAY" >/dev/null 2>&1
+        fi
+    done
+}
+wifi_keepalive &
+KEEPALIVE_PID=$!
+
 # Run hadisplay.
 if [ -n "${ORIG_LD_LIBRARY_PATH}" ]; then
     export LD_LIBRARY_PATH="${HADISPLAY_LD_LIBRARY_PATH}:${ORIG_LD_LIBRARY_PATH}"
@@ -39,6 +71,10 @@ fi
 cd "${HADISPLAY_DIR}" || exit 1
 ./hadisplay >>"${LOGFILE}" 2>&1
 RETVAL=$?
+
+# Stop the keepalive when hadisplay exits.
+kill "$KEEPALIVE_PID" 2>/dev/null
+wait "$KEEPALIVE_PID" 2>/dev/null
 
 # Restart Nickel.
 if [ -n "${ORIG_LD_LIBRARY_PATH}" ]; then

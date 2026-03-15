@@ -124,16 +124,17 @@ void draw_wifi_icon(RenderBuffer& buffer,
                     const Rect& rect,
                     bool connected,
                     Color value,
-                    Color muted) {
+                    Color disconnected,
+                    Color /*muted*/) {
     const int cx = rect.x + (rect.width / 2);
     const int cy = rect.y + rect.height - 14;
-    const Color stroke = connected ? value : muted;
+    const Color stroke = connected ? value : disconnected;
     draw_arc(buffer, width, height, cx, cy, 10, kPi * 1.14, kPi * 1.86, 3, stroke);
     draw_arc(buffer, width, height, cx, cy, 19, kPi * 1.14, kPi * 1.86, 3, stroke);
     draw_arc(buffer, width, height, cx, cy, 28, kPi * 1.14, kPi * 1.86, 3, stroke);
-    fill_rect(buffer, width, height, {cx - 3, cy - 3, 6, 6}, connected ? value : muted);
+    fill_rect(buffer, width, height, {cx - 3, cy - 3, 6, 6}, stroke);
     if (!connected) {
-        draw_line(buffer, width, height, rect.x + 14, rect.y + 14, rect.x + rect.width - 14, rect.y + rect.height - 14, 4, value);
+        draw_line(buffer, width, height, rect.x + 14, rect.y + 14, rect.x + rect.width - 14, rect.y + rect.height - 14, 4, disconnected);
     }
 }
 

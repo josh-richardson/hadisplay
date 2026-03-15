@@ -392,6 +392,15 @@ struct DeviceStatus::Impl {
         return "OFF";
     }
 
+    void attempt_wifi_recovery() {
+        ensure_wifi_interface();
+        const std::string iface = wifi_interface.empty() ? "wlan0" : wifi_interface;
+
+        // Try wpa_cli reconnect first (lightweight).
+        const std::string reconnect_cmd = "wpa_cli -i " + iface + " reconnect >/dev/null 2>&1";
+        std::system(reconnect_cmd.c_str());
+    }
+
     std::string read_battery_label() {
         ensure_battery_supply();
         if (battery_supply_path.empty()) {
@@ -507,6 +516,13 @@ bool DeviceStatus::cycle_brightness(SystemStatus& out_status) {
         out_status.brightness_label = make_brightness_label(next_percent);
     }
     return ok;
+}
+
+void DeviceStatus::try_wifi_recovery() {
+    if (impl_ == nullptr) {
+        impl_ = new Impl();
+    }
+    impl_->attempt_wifi_recovery();
 }
 
 DeviceStatus::~DeviceStatus() {

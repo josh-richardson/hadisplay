@@ -31,6 +31,7 @@ void draw_wifi_icon(RenderBuffer& buffer,
                     const Rect& rect,
                     bool connected,
                     Color value,
+                    Color disconnected,
                     Color muted);
 void draw_cloud_icon(RenderBuffer& buffer,
                      int width,

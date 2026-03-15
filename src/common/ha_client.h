@@ -20,6 +20,7 @@ enum class EntityKind {
     Light = 0,
     Switch,
     Climate,
+    Sensor,
 };
 
 struct EntityState {
@@ -46,6 +47,11 @@ struct EntityState {
     int current_temperature = 0;
     int target_temperature = 0;
     std::string hvac_action;
+    std::string device_class;
+    std::string unit_of_measurement;
+    std::string state_class;
+    bool has_numeric_value = false;
+    double numeric_value = 0.0;
 };
 
 struct EntityListResult {
@@ -88,6 +94,15 @@ struct WeatherState {
     std::string message;
 };
 
+struct SensorHistoryResult {
+    bool ok = false;
+    std::string entity_id;
+    std::vector<double> values;
+    double min_value = 0.0;
+    double max_value = 0.0;
+    std::string message;
+};
+
 class Client {
   public:
     explicit Client(ClientConfig config = {});
@@ -104,6 +119,7 @@ class Client {
     [[nodiscard]] Result set_light_color_temperature(const std::string& entity_id, int kelvin) const;
     [[nodiscard]] Result set_light_rgb(const std::string& entity_id, int red, int green, int blue) const;
     [[nodiscard]] Result set_climate_hvac_mode(const std::string& entity_id, const std::string& hvac_mode) const;
+    [[nodiscard]] SensorHistoryResult fetch_sensor_history(const std::string& entity_id) const;
     [[nodiscard]] WeatherState fetch_weather_state() const;
 
   private:

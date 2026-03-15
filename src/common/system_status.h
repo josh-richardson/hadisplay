@@ -29,6 +29,7 @@ class DeviceStatus {
 
     [[nodiscard]] SystemStatus snapshot();
     bool cycle_brightness(SystemStatus& out_status);
+    void try_wifi_recovery();
     [[nodiscard]] const std::string& last_error() const;
 
   private:

@@ -99,6 +99,7 @@ enum class EntityKind {
     Light = 0,
     Switch,
     Climate,
+    Sensor,
 };
 
 struct EntityItem {
@@ -115,6 +116,8 @@ struct EntityItem {
     bool supports_color_temp = false;
     bool supports_rgb = false;
     bool supports_heat_control = false;
+    bool supports_history = false;
+    bool has_numeric_value = false;
     int brightness_percent = 0;
     int color_temp_kelvin = 0;
     int min_color_temp_kelvin = 0;
@@ -124,6 +127,9 @@ struct EntityItem {
     int rgb_blue = 255;
     int current_temperature = 0;
     int target_temperature = 0;
+    double numeric_value = 0.0;
+    std::string device_class;
+    std::string unit_label;
     std::string hvac_action;
 };
 
@@ -152,6 +158,12 @@ struct SceneState {
     bool weather_available = false;
     std::string weather_condition = "cloudy";
     std::string weather_range_label = "--/--";
+    std::string detail_history_entity_id;
+    bool detail_history_loading = false;
+    bool detail_history_available = false;
+    std::vector<double> detail_history_values;
+    double detail_history_min = 0.0;
+    double detail_history_max = 0.0;
     std::string status = "STARTING";
 };
 

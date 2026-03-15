@@ -218,6 +218,15 @@ bool number_as_int(const json::Value* value, int& out) {
     return true;
 }
 
+bool parse_double_string(const std::string& text, double& out) {
+    if (text.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    out = std::strtod(text.c_str(), &end);
+    return end != nullptr && *end == '\0' && std::isfinite(out) != 0;
+}
+
 bool parse_rgb(const json::Value* value, int& red, int& green, int& blue) {
     const json::Value::Array* rgb = array_if(value);
     if (rgb == nullptr || rgb->size() < 3) {
@@ -459,6 +468,34 @@ EntityState parse_climate_state(const json::Value& value) {
     return entity;
 }
 
+EntityState parse_sensor_state(const json::Value& value) {
+    EntityState entity;
+    entity.kind = EntityKind::Sensor;
+    if (value.as_object_if() == nullptr) {
+        entity.message = "Sensor payload was not an object";
+        return entity;
+    }
+
+    entity.entity_id = string_or(value.get("entity_id"));
+    entity.state = trim(string_or(value.get("state")));
+    if (entity.entity_id.empty() || !entity.entity_id.starts_with("sensor.")) {
+        entity.message = "Not a sensor entity";
+        return entity;
+    }
+
+    const json::Value* attributes_value = value.get("attributes");
+    entity.friendly_name = friendly_name_or_entity_id(entity.entity_id, attributes_value);
+    entity.available = entity.state != "unavailable" && entity.state != "unknown";
+    entity.device_class = lowercase_ascii(string_or(attributes_value != nullptr ? attributes_value->get("device_class") : nullptr));
+    entity.unit_of_measurement = string_or(attributes_value != nullptr ? attributes_value->get("unit_of_measurement") : nullptr);
+    entity.state_class = lowercase_ascii(string_or(attributes_value != nullptr ? attributes_value->get("state_class") : nullptr));
+    entity.supports_detail = true;
+    entity.has_numeric_value = parse_double_string(entity.state, entity.numeric_value);
+    entity.ok = true;
+    entity.message = "Sensor refreshed";
+    return entity;
+}
+
 EntityState parse_entity_state(const json::Value& value) {
     const std::string entity_id = string_or(value.get("entity_id"));
     if (entity_id.starts_with("light.")) {
@@ -469,6 +506,9 @@ EntityState parse_entity_state(const json::Value& value) {
     }
     if (entity_id.starts_with("climate.")) {
         return parse_climate_state(value);
+    }
+    if (entity_id.starts_with("sensor.")) {
+        return parse_sensor_state(value);
     }
     EntityState entity;
     entity.entity_id = entity_id;
@@ -599,7 +639,8 @@ EntityListResult Client::list_entities() const {
         const std::string entity_id = string_or(entry.get("entity_id"));
         if (!entity_id.starts_with("light.") &&
             !entity_id.starts_with("switch.") &&
-            !entity_id.starts_with("climate.")) {
+            !entity_id.starts_with("climate.") &&
+            !entity_id.starts_with("sensor.")) {
             continue;
         }
 
@@ -621,13 +662,21 @@ EntityListResult Client::list_entities() const {
 
 EntityState Client::fetch_entity_state(const std::string& entity_id) const {
     if (!configured()) {
-        return {.ok = false, .entity_id = entity_id, .message = configuration_error_};
+        EntityState entity;
+        entity.ok = false;
+        entity.entity_id = entity_id;
+        entity.message = configuration_error_;
+        return entity;
     }
 
     const HttpResult result = http_request_json("GET", base_url_ + "/api/states/" + entity_id, token_, nullptr);
     const json::ParseResult parsed = parse_http_json(result);
     if (!parsed.ok) {
-        return {.ok = false, .entity_id = entity_id, .message = parsed.error};
+        EntityState entity;
+        entity.ok = false;
+        entity.entity_id = entity_id;
+        entity.message = parsed.error;
+        return entity;
     }
 
     EntityState entity = parse_entity_state(parsed.value);
@@ -694,6 +743,73 @@ LightState Client::fetch_light_state(const std::string& entity_id) const {
         .rgb_green = entity.rgb_green,
         .rgb_blue = entity.rgb_blue,
     };
+}
+
+SensorHistoryResult Client::fetch_sensor_history(const std::string& entity_id) const {
+    if (!configured()) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = configuration_error_};
+    }
+    if (!entity_id.starts_with("sensor.")) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = "History is only supported for sensor entities"};
+    }
+
+    const HttpResult result = http_request_json("GET",
+                                                base_url_ + "/api/history/period?filter_entity_id=" + entity_id + "&minimal_response&no_attributes",
+                                                token_,
+                                                nullptr);
+    const json::ParseResult parsed = parse_http_json(result);
+    if (!parsed.ok) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = parsed.error};
+    }
+
+    const json::Value::Array* history_groups = parsed.value.as_array_if();
+    if (history_groups == nullptr) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = "History payload was not an array"};
+    }
+
+    const json::Value::Array* history = nullptr;
+    for (const json::Value& group : *history_groups) {
+        const json::Value::Array* series = group.as_array_if();
+        if (series != nullptr) {
+            history = series;
+            break;
+        }
+    }
+    if (history == nullptr) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = "No history series returned"};
+    }
+
+    SensorHistoryResult sensor_history{
+        .ok = true,
+        .entity_id = entity_id,
+        .values = {},
+        .min_value = 0.0,
+        .max_value = 0.0,
+        .message = "Sensor history fetched",
+    };
+
+    bool have_numeric_sample = false;
+    for (const json::Value& point : *history) {
+        double value = 0.0;
+        if (!parse_double_string(trim(string_or(point.get("state"))), value)) {
+            continue;
+        }
+        sensor_history.values.push_back(value);
+        if (!have_numeric_sample) {
+            sensor_history.min_value = value;
+            sensor_history.max_value = value;
+            have_numeric_sample = true;
+            continue;
+        }
+        sensor_history.min_value = std::min(sensor_history.min_value, value);
+        sensor_history.max_value = std::max(sensor_history.max_value, value);
+    }
+
+    if (!have_numeric_sample) {
+        return {.ok = false, .entity_id = entity_id, .values = {}, .min_value = 0.0, .max_value = 0.0, .message = "No numeric sensor history returned"};
+    }
+
+    return sensor_history;
 }
 
 Result Client::toggle_light(const std::string& entity_id) const {
