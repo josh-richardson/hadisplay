@@ -12,16 +12,21 @@
 #include <chrono>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <set>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -59,6 +64,63 @@ struct DisplaySettings {
 struct ClockStatus {
     std::string time_label;
     std::string date_label;
+};
+
+struct EntityRefreshCompletion {
+    std::uint64_t epoch = 0;
+    ha::EntityListResult list_result;
+    std::string success_status = "DEVICES SYNCED";
+    std::string empty_selection_status = "DEVICES SYNCED";
+};
+
+struct WeatherRefreshCompletion {
+    std::uint64_t epoch = 0;
+    ha::WeatherState weather;
+};
+
+enum class EntityActionType {
+    ToggleLight = 0,
+    ToggleSwitch,
+    SetClimateMode,
+    SetBrightness,
+    SetColorTemperature,
+    SetRgb,
+};
+
+struct EntityActionRequest {
+    EntityActionType type = EntityActionType::ToggleLight;
+    std::string entity_id;
+    int value1 = 0;
+    int value2 = 0;
+    int value3 = 0;
+    std::string text;
+    std::string success_status = "ENTITY UPDATED";
+};
+
+struct EntityActionCompletion {
+    std::uint64_t epoch = 0;
+    std::string entity_id;
+    ha::Result request_result;
+    ha::EntityState updated_state;
+    std::string success_status = "ENTITY UPDATED";
+};
+
+using AsyncCompletion = std::variant<EntityRefreshCompletion, WeatherRefreshCompletion, EntityActionCompletion>;
+
+struct AsyncMailbox {
+    std::mutex mutex;
+    std::vector<AsyncCompletion> completions;
+};
+
+struct AsyncState {
+    std::shared_ptr<AsyncMailbox> mailbox = std::make_shared<AsyncMailbox>();
+    bool entity_refresh_pending = false;
+    bool weather_refresh_pending = false;
+    bool entity_action_pending = false;
+    std::uint64_t next_entity_epoch = 0;
+    std::uint64_t latest_entity_applied_epoch = 0;
+    std::uint64_t next_weather_epoch = 0;
+    std::uint64_t latest_weather_applied_epoch = 0;
 };
 
 std::string uppercase_ascii(std::string value) {
@@ -162,6 +224,18 @@ bool update_weather_state(hadisplay::SceneState& scene_state, const ha::WeatherS
 
     apply_weather_state(scene_state, weather);
     return true;
+}
+
+void post_async_completion(const std::shared_ptr<AsyncMailbox>& mailbox, AsyncCompletion completion) {
+    std::lock_guard<std::mutex> lock(mailbox->mutex);
+    mailbox->completions.push_back(std::move(completion));
+}
+
+std::vector<AsyncCompletion> take_async_completions(AsyncState& async_state) {
+    std::lock_guard<std::mutex> lock(async_state.mailbox->mutex);
+    std::vector<AsyncCompletion> completions;
+    completions.swap(async_state.mailbox->completions);
+    return completions;
 }
 
 void signal_handler(int) {
@@ -301,6 +375,13 @@ hadisplay::AppConfig config_from_scene(const hadisplay::SceneState& scene_state,
     return config;
 }
 
+hadisplay::AppConfig selection_config_for_sync(const hadisplay::SceneState& scene_state, const hadisplay::AppConfig& base_config) {
+    if (scene_state.entities.empty()) {
+        return base_config;
+    }
+    return config_from_scene(scene_state, base_config);
+}
+
 void populate_entities(hadisplay::SceneState& scene_state,
                        const ha::EntityListResult& list_result,
                        const hadisplay::AppConfig& config) {
@@ -325,18 +406,10 @@ void populate_entities(hadisplay::SceneState& scene_state,
     }
 }
 
-bool refresh_entities(hadisplay::SceneState& scene_state,
-                      const ha::Client& ha_client,
-                      const hadisplay::AppConfig& config) {
-    if (!ha_client.configured()) {
-        scene_state.status = "CHECK CONFIG";
-        scene_state.entities.clear();
-        return false;
-    }
-
-    const ha::EntityListResult list_result = ha_client.list_entities();
+bool apply_entity_list_result(hadisplay::SceneState& scene_state,
+                              const ha::EntityListResult& list_result,
+                              const hadisplay::AppConfig& config) {
     if (!list_result.ok) {
-        scene_state.status = concise_ha_error(list_result.message);
         return false;
     }
 
@@ -356,8 +429,164 @@ bool refresh_entities(hadisplay::SceneState& scene_state,
     if (scene_state.view_mode == hadisplay::ViewMode::Detail && scene_state.detail_entity_index < 0) {
         scene_state.view_mode = hadisplay::ViewMode::Dashboard;
     }
-    scene_state.status = "DEVICES SYNCED";
     return true;
+}
+
+bool has_selected_entities(const hadisplay::AppConfig& config) {
+    return !config.selected_entity_ids.empty();
+}
+
+void schedule_entity_refresh(AsyncState& async_state,
+                             const ha::Client& ha_client,
+                             const std::string& success_status,
+                             const std::string& empty_selection_status) {
+    if (async_state.entity_refresh_pending) {
+        return;
+    }
+
+    async_state.entity_refresh_pending = true;
+    const std::uint64_t epoch = ++async_state.next_entity_epoch;
+    const std::shared_ptr<AsyncMailbox> mailbox = async_state.mailbox;
+    std::thread([mailbox, ha_client, epoch, success_status, empty_selection_status]() mutable {
+        post_async_completion(mailbox,
+                              EntityRefreshCompletion{
+                                  .epoch = epoch,
+                                  .list_result = ha_client.list_entities(),
+                                  .success_status = success_status,
+                                  .empty_selection_status = empty_selection_status,
+                              });
+    }).detach();
+}
+
+void schedule_weather_refresh(AsyncState& async_state, const ha::Client& ha_client) {
+    if (async_state.weather_refresh_pending) {
+        return;
+    }
+
+    async_state.weather_refresh_pending = true;
+    const std::uint64_t epoch = ++async_state.next_weather_epoch;
+    const std::shared_ptr<AsyncMailbox> mailbox = async_state.mailbox;
+    std::thread([mailbox, ha_client, epoch]() mutable {
+        post_async_completion(mailbox,
+                              WeatherRefreshCompletion{
+                                  .epoch = epoch,
+                                  .weather = ha_client.fetch_weather_state(),
+                              });
+    }).detach();
+}
+
+bool schedule_entity_action(AsyncState& async_state, const ha::Client& ha_client, EntityActionRequest request) {
+    if (async_state.entity_action_pending) {
+        return false;
+    }
+
+    async_state.entity_action_pending = true;
+    const std::uint64_t epoch = ++async_state.next_entity_epoch;
+    const std::shared_ptr<AsyncMailbox> mailbox = async_state.mailbox;
+    std::thread([mailbox, ha_client, epoch, request = std::move(request)]() mutable {
+        ha::Result request_result;
+        switch (request.type) {
+            case EntityActionType::ToggleLight:
+                request_result = ha_client.toggle_light(request.entity_id);
+                break;
+            case EntityActionType::ToggleSwitch:
+                request_result = ha_client.toggle_switch(request.entity_id);
+                break;
+            case EntityActionType::SetClimateMode:
+                request_result = ha_client.set_climate_hvac_mode(request.entity_id, request.text);
+                break;
+            case EntityActionType::SetBrightness:
+                request_result = ha_client.set_light_brightness(request.entity_id, request.value1);
+                break;
+            case EntityActionType::SetColorTemperature:
+                request_result = ha_client.set_light_color_temperature(request.entity_id, request.value1);
+                break;
+            case EntityActionType::SetRgb:
+                request_result = ha_client.set_light_rgb(request.entity_id, request.value1, request.value2, request.value3);
+                break;
+        }
+
+        ha::EntityState updated_state;
+        if (request_result.ok) {
+            updated_state = ha_client.fetch_entity_state(request.entity_id);
+        } else {
+            updated_state.entity_id = request.entity_id;
+        }
+
+        post_async_completion(mailbox,
+                              EntityActionCompletion{
+                                  .epoch = epoch,
+                                  .entity_id = request.entity_id,
+                                  .request_result = std::move(request_result),
+                                  .updated_state = std::move(updated_state),
+                                  .success_status = request.success_status,
+                              });
+    }).detach();
+    return true;
+}
+
+bool process_async_completions(AsyncState& async_state,
+                               hadisplay::SceneState& scene_state,
+                               const hadisplay::AppConfig& config) {
+    bool needs_redraw = false;
+    for (AsyncCompletion& completion : take_async_completions(async_state)) {
+        if (std::holds_alternative<EntityRefreshCompletion>(completion)) {
+            async_state.entity_refresh_pending = false;
+            EntityRefreshCompletion refresh = std::move(std::get<EntityRefreshCompletion>(completion));
+            if (refresh.epoch < async_state.latest_entity_applied_epoch) {
+                continue;
+            }
+            async_state.latest_entity_applied_epoch = refresh.epoch;
+            if (!apply_entity_list_result(scene_state, refresh.list_result, selection_config_for_sync(scene_state, config))) {
+                scene_state.status = concise_ha_error(refresh.list_result.message);
+                needs_redraw = true;
+                continue;
+            }
+            scene_state.status = has_selected_entities(selection_config_for_sync(scene_state, config))
+                ? refresh.success_status
+                : refresh.empty_selection_status;
+            needs_redraw = true;
+            continue;
+        }
+
+        if (std::holds_alternative<WeatherRefreshCompletion>(completion)) {
+            async_state.weather_refresh_pending = false;
+            WeatherRefreshCompletion weather = std::move(std::get<WeatherRefreshCompletion>(completion));
+            if (weather.epoch < async_state.latest_weather_applied_epoch) {
+                continue;
+            }
+            async_state.latest_weather_applied_epoch = weather.epoch;
+            if (update_weather_state(scene_state, weather.weather)) {
+                needs_redraw = true;
+            }
+            continue;
+        }
+
+        async_state.entity_action_pending = false;
+        EntityActionCompletion action = std::move(std::get<EntityActionCompletion>(completion));
+        if (action.epoch < async_state.latest_entity_applied_epoch) {
+            continue;
+        }
+        async_state.latest_entity_applied_epoch = action.epoch;
+        if (!action.request_result.ok) {
+            scene_state.status = concise_ha_error(action.request_result.message);
+            needs_redraw = true;
+            continue;
+        }
+        if (!action.updated_state.ok) {
+            scene_state.status = concise_ha_error(action.updated_state.message);
+            needs_redraw = true;
+            continue;
+        }
+
+        const std::optional<int> entity_index = find_entity_index(scene_state, action.entity_id);
+        if (entity_index.has_value()) {
+            apply_entity_update(scene_state, *entity_index, action.updated_state);
+        }
+        scene_state.status = action.success_status;
+        needs_redraw = true;
+    }
+    return needs_redraw;
 }
 
 bool should_do_full_refresh(const RenderState& render_state, bool force_full_refresh) {
@@ -442,49 +671,14 @@ void clear_screen(int fbfd, bool full_refresh, const DisplaySettings& display_se
     fbink_cls(fbfd, &cfg, nullptr, false);
 }
 
-bool apply_remote_update(int fbfd,
-                         hadisplay::SceneState& scene_state,
-                         std::vector<hadisplay::Button>& buttons,
-                         const DisplaySettings& display_settings,
-                         RenderState& render_state,
-                         const ha::Client& ha_client,
-                         int entity_index,
-                         const std::string& busy_status,
-                         const std::function<ha::Result()>& request) {
-    scene_state.status = busy_status;
-    buttons = hadisplay::buttons_for(scene_state);
-    if (!render(fbfd, scene_state, buttons, display_settings, render_state)) {
-        return false;
-    }
-
-    const ha::Result result = request();
-    if (!result.ok) {
-        scene_state.status = concise_ha_error(result.message);
-        return true;
-    }
-
-    const std::string entity_id = scene_state.entities[static_cast<std::size_t>(entity_index)].entity_id;
-    const ha::EntityState updated = ha_client.fetch_entity_state(entity_id);
-    if (!updated.ok) {
-        scene_state.status = concise_ha_error(updated.message);
-        return true;
-    }
-
-    apply_entity_update(scene_state, entity_index, updated);
-    scene_state.status = "ENTITY UPDATED";
-    return true;
-}
-
-bool handle_button_action(int fbfd,
-                          hadisplay::SceneState& scene_state,
+bool handle_button_action(hadisplay::SceneState& scene_state,
                           std::vector<hadisplay::Button>& buttons,
                           const ha::Client& ha_client,
                           hadisplay::DeviceStatus& device_status,
                           hadisplay::ConfigStore& config_store,
                           hadisplay::AppConfig& config,
-                          const DisplaySettings& display_settings,
+                          AsyncState& async_state,
                           bool& config_dirty,
-                          RenderState& render_state,
                           int button_index,
                           bool& needs_redraw,
                           bool& force_full_refresh) {
@@ -529,7 +723,12 @@ bool handle_button_action(int fbfd,
             needs_redraw = true;
             return false;
         case hadisplay::ButtonId::SetupRefresh:
-            refresh_entities(scene_state, ha_client, config_from_scene(scene_state, config));
+            if (!ha_client.configured()) {
+                scene_state.status = "CHECK CONFIG";
+            } else {
+                schedule_entity_refresh(async_state, ha_client, "DEVICES SYNCED", "DEVICES SYNCED");
+                scene_state.status = "SYNCING DEVICES";
+            }
             needs_redraw = true;
             return false;
         case hadisplay::ButtonId::SetupSave: {
@@ -552,24 +751,27 @@ bool handle_button_action(int fbfd,
             if (action_button.value >= 0 && action_button.value < static_cast<int>(scene_state.entities.size())) {
                 const hadisplay::EntityItem& entity = scene_state.entities[static_cast<std::size_t>(action_button.value)];
                 const std::string busy_status = entity.kind == hadisplay::EntityKind::Climate ? "SETTING HEATING" : "TOGGLING DEVICE";
-                if (!apply_remote_update(fbfd,
-                                         scene_state,
-                                         buttons,
-                                         display_settings,
-                                         render_state,
-                                         ha_client,
-                                         action_button.value,
-                                         busy_status,
-                                         [&]() {
-                                             if (entity.kind == hadisplay::EntityKind::Light) {
-                                                 return ha_client.toggle_light(entity.entity_id);
-                                             }
-                                             if (entity.kind == hadisplay::EntityKind::Switch) {
-                                                 return ha_client.toggle_switch(entity.entity_id);
-                                             }
-                                             return ha_client.set_climate_hvac_mode(entity.entity_id, entity.is_on ? "off" : "heat");
-                                         })) {
-                    return true;
+                if (!ha_client.configured()) {
+                    scene_state.status = "CHECK CONFIG";
+                    needs_redraw = true;
+                    return false;
+                }
+                EntityActionRequest request{
+                    .entity_id = entity.entity_id,
+                    .text = {},
+                };
+                if (entity.kind == hadisplay::EntityKind::Light) {
+                    request.type = EntityActionType::ToggleLight;
+                } else if (entity.kind == hadisplay::EntityKind::Switch) {
+                    request.type = EntityActionType::ToggleSwitch;
+                } else {
+                    request.type = EntityActionType::SetClimateMode;
+                    request.text = entity.is_on ? "off" : "heat";
+                }
+                if (schedule_entity_action(async_state, ha_client, std::move(request))) {
+                    scene_state.status = busy_status;
+                } else {
+                    scene_state.status = "HA REQUEST ACTIVE";
                 }
                 needs_redraw = true;
             }
@@ -594,7 +796,12 @@ bool handle_button_action(int fbfd,
             needs_redraw = true;
             return false;
         case hadisplay::ButtonId::DashboardRefresh:
-            refresh_entities(scene_state, ha_client, config_from_scene(scene_state, config));
+            if (!ha_client.configured()) {
+                scene_state.status = "CHECK CONFIG";
+            } else {
+                schedule_entity_refresh(async_state, ha_client, "DEVICES SYNCED", "DEVICES SYNCED");
+                scene_state.status = "SYNCING DEVICES";
+            }
             needs_redraw = true;
             return false;
         case hadisplay::ButtonId::DetailBack:
@@ -606,24 +813,28 @@ bool handle_button_action(int fbfd,
             if (scene_state.detail_entity_index >= 0 && scene_state.detail_entity_index < static_cast<int>(scene_state.entities.size())) {
                 const int entity_index = scene_state.detail_entity_index;
                 const hadisplay::EntityItem& entity = scene_state.entities[static_cast<std::size_t>(entity_index)];
-                if (!apply_remote_update(fbfd,
-                                         scene_state,
-                                         buttons,
-                                         display_settings,
-                                         render_state,
-                                         ha_client,
-                                         entity_index,
-                                         entity.kind == hadisplay::EntityKind::Climate ? "SETTING HEATING" : "TOGGLING DEVICE",
-                                         [&]() {
-                                             if (entity.kind == hadisplay::EntityKind::Light) {
-                                                 return ha_client.toggle_light(entity.entity_id);
-                                             }
-                                             if (entity.kind == hadisplay::EntityKind::Switch) {
-                                                 return ha_client.toggle_switch(entity.entity_id);
-                                             }
-                                             return ha_client.set_climate_hvac_mode(entity.entity_id, entity.is_on ? "off" : "heat");
-                                         })) {
-                    return true;
+                if (!ha_client.configured()) {
+                    scene_state.status = "CHECK CONFIG";
+                    needs_redraw = true;
+                    return false;
+                }
+                const std::string busy_status = entity.kind == hadisplay::EntityKind::Climate ? "SETTING HEATING" : "TOGGLING DEVICE";
+                EntityActionRequest request{
+                    .entity_id = entity.entity_id,
+                    .text = {},
+                };
+                if (entity.kind == hadisplay::EntityKind::Light) {
+                    request.type = EntityActionType::ToggleLight;
+                } else if (entity.kind == hadisplay::EntityKind::Switch) {
+                    request.type = EntityActionType::ToggleSwitch;
+                } else {
+                    request.type = EntityActionType::SetClimateMode;
+                    request.text = entity.is_on ? "off" : "heat";
+                }
+                if (schedule_entity_action(async_state, ha_client, std::move(request))) {
+                    scene_state.status = busy_status;
+                } else {
+                    scene_state.status = "HA REQUEST ACTIVE";
                 }
                 needs_redraw = true;
             }
@@ -645,7 +856,11 @@ bool handle_button_action(int fbfd,
             if (entity.kind != hadisplay::EntityKind::Light) {
                 return false;
             }
-            const std::string entity_id = entity.entity_id;
+            if (!ha_client.configured()) {
+                scene_state.status = "CHECK CONFIG";
+                needs_redraw = true;
+                return false;
+            }
 
             auto clamp_kelvin = [&](int value) {
                 int min_kelvin = entity.min_color_temp_kelvin > 0 ? entity.min_color_temp_kelvin : 2200;
@@ -656,44 +871,42 @@ bool handle_button_action(int fbfd,
                 return std::clamp(value, min_kelvin, max_kelvin);
             };
 
-            ha::Result result;
+            EntityActionRequest request{
+                .entity_id = entity.entity_id,
+                .text = {},
+            };
             if (action_button.id == hadisplay::ButtonId::DetailBrightnessDown ||
                 action_button.id == hadisplay::ButtonId::DetailBrightnessUp) {
                 const int delta = action_button.id == hadisplay::ButtonId::DetailBrightnessUp ? 10 : -10;
-                result = ha_client.set_light_brightness(entity_id, std::clamp(entity.brightness_percent + delta, 0, 100));
+                request.type = EntityActionType::SetBrightness;
+                request.value1 = std::clamp(entity.brightness_percent + delta, 0, 100);
             } else if (action_button.id == hadisplay::ButtonId::DetailSetRed) {
-                result = ha_client.set_light_rgb(entity_id, 255, 0, 0);
+                request.type = EntityActionType::SetRgb;
+                request.value1 = 255;
             } else if (action_button.id == hadisplay::ButtonId::DetailSetGreen) {
-                result = ha_client.set_light_rgb(entity_id, 0, 255, 0);
+                request.type = EntityActionType::SetRgb;
+                request.value2 = 255;
             } else if (action_button.id == hadisplay::ButtonId::DetailSetBlue) {
-                result = ha_client.set_light_rgb(entity_id, 0, 0, 255);
+                request.type = EntityActionType::SetRgb;
+                request.value3 = 255;
             } else if (action_button.id == hadisplay::ButtonId::DetailSetDaylight) {
-                const int daylight = clamp_kelvin(entity.max_color_temp_kelvin > 0 ? entity.max_color_temp_kelvin : 6500);
-                result = ha_client.set_light_color_temperature(entity_id, daylight);
+                request.type = EntityActionType::SetColorTemperature;
+                request.value1 = clamp_kelvin(entity.max_color_temp_kelvin > 0 ? entity.max_color_temp_kelvin : 6500);
             } else if (action_button.id == hadisplay::ButtonId::DetailSetNeutral) {
                 const int min_kelvin = entity.min_color_temp_kelvin > 0 ? entity.min_color_temp_kelvin : 2200;
                 const int max_kelvin = entity.max_color_temp_kelvin > 0 ? entity.max_color_temp_kelvin : 6500;
-                result = ha_client.set_light_color_temperature(entity_id, clamp_kelvin((min_kelvin + max_kelvin) / 2));
+                request.type = EntityActionType::SetColorTemperature;
+                request.value1 = clamp_kelvin((min_kelvin + max_kelvin) / 2);
             } else {
-                const int warm = clamp_kelvin(2800);
-                result = ha_client.set_light_color_temperature(entity_id, warm);
+                request.type = EntityActionType::SetColorTemperature;
+                request.value1 = clamp_kelvin(2800);
             }
 
-            if (!result.ok) {
-                scene_state.status = concise_ha_error(result.message);
-                needs_redraw = true;
-                return false;
+            if (schedule_entity_action(async_state, ha_client, std::move(request))) {
+                scene_state.status = "UPDATING LIGHT";
+            } else {
+                scene_state.status = "HA REQUEST ACTIVE";
             }
-
-            const ha::EntityState updated = ha_client.fetch_entity_state(entity_id);
-            if (!updated.ok) {
-                scene_state.status = concise_ha_error(updated.message);
-                needs_redraw = true;
-                return false;
-            }
-
-            apply_entity_update(scene_state, entity_index, updated);
-            scene_state.status = "ENTITY UPDATED";
             needs_redraw = true;
             return false;
         }
@@ -753,18 +966,22 @@ int main() {
         .token = config.ha_token,
         .weather_entity_id = config.ha_weather_entity,
     });
-    apply_weather_state(scene_state, ha_client.fetch_weather_state());
+    AsyncState async_state;
 
     if (ha_client.configured()) {
-        refresh_entities(scene_state, ha_client, config);
-        if (!config.selected_entity_ids.empty()) {
+        if (has_selected_entities(config)) {
             scene_state.view_mode = hadisplay::ViewMode::Dashboard;
         } else {
             scene_state.view_mode = hadisplay::ViewMode::Setup;
-            if (scene_state.status == "DEVICES SYNCED") {
-                scene_state.status = loaded_config.found ? "CONFIG EMPTY" : "SELECT LIGHTS";
-            }
         }
+        if (scene_state.status == "STARTING") {
+            scene_state.status = "SYNCING DEVICES";
+        }
+        schedule_entity_refresh(async_state,
+                                ha_client,
+                                "DEVICES SYNCED",
+                                loaded_config.found ? "CONFIG EMPTY" : "SELECT LIGHTS");
+        schedule_weather_refresh(async_state, ha_client);
     } else {
         scene_state.status = "CHECK CONFIG";
         scene_state.view_mode = hadisplay::ViewMode::Setup;
@@ -879,6 +1096,10 @@ int main() {
             }
         }
 
+        if (process_async_completions(async_state, scene_state, config)) {
+            needs_redraw = true;
+        }
+
         now = std::chrono::steady_clock::now();
         const auto fast_or_light = scene_state.dev_mode ? kDevPollInterval : kNormalLightPollInterval;
         const auto fast_or_device = scene_state.dev_mode ? kDevPollInterval : kNormalDevicePollInterval;
@@ -890,8 +1111,8 @@ int main() {
             next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
         }
         if (now >= next_light_refresh) {
-            if (refresh_entities(scene_state, ha_client, config_from_scene(scene_state, config))) {
-                needs_redraw = true;
+            if (ha_client.configured()) {
+                schedule_entity_refresh(async_state, ha_client, "DEVICES SYNCED", "DEVICES SYNCED");
             }
             next_light_refresh = now + fast_or_light;
         }
@@ -902,8 +1123,8 @@ int main() {
             next_device_refresh = now + fast_or_device;
         }
         if (now >= next_weather_refresh) {
-            if (update_weather_state(scene_state, ha_client.fetch_weather_state())) {
-                needs_redraw = true;
+            if (ha_client.configured()) {
+                schedule_weather_refresh(async_state, ha_client);
             }
             next_weather_refresh = now + fast_or_weather;
         }
@@ -919,16 +1140,14 @@ int main() {
 
         if (pending_button >= 0) {
             buttons = hadisplay::buttons_for(scene_state);
-            const bool should_exit = handle_button_action(fbfd,
-                                                          scene_state,
+            const bool should_exit = handle_button_action(scene_state,
                                                           buttons,
                                                           ha_client,
                                                           device_status,
                                                           config_store,
                                                           config,
-                                                          display_settings,
+                                                          async_state,
                                                           config_dirty,
-                                                          render_state,
                                                           pending_button,
                                                           needs_redraw,
                                                           force_full_refresh);

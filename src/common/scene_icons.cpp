@@ -85,21 +85,37 @@ void draw_cog_icon(RenderBuffer& buffer,
                    Color value) {
     const int cx = rect.x + (rect.width / 2);
     const int cy = rect.y + (rect.height / 2);
-    const int inner = std::max(8, std::min(rect.width, rect.height) / 5);
-    const int outer = inner + 12;
+    const int size = std::min(rect.width, rect.height);
+    const int body_r = size / 3;
+    const int tooth_r = size / 2 - 2;
+    const int hole_r = size / 8;
+    const int tooth_w = 5;
 
-    for (int i = 0; i < 8; ++i) {
-        const double angle = (kPi / 4.0) * static_cast<double>(i);
-        const int x0 = cx + static_cast<int>(std::lround(std::cos(angle) * (inner + 4)));
-        const int y0 = cy + static_cast<int>(std::lround(std::sin(angle) * (inner + 4)));
-        const int x1 = cx + static_cast<int>(std::lround(std::cos(angle) * outer));
-        const int y1 = cy + static_cast<int>(std::lround(std::sin(angle) * outer));
-        draw_line(buffer, width, height, x0, y0, x1, y1, 4, value);
+    // Draw 6 gear teeth as thick, short stubs.
+    for (int i = 0; i < 6; ++i) {
+        const double angle = (kPi / 3.0) * static_cast<double>(i);
+        const double cos_a = std::cos(angle);
+        const double sin_a = std::sin(angle);
+        const int x0 = cx + static_cast<int>(std::lround(cos_a * (body_r - 2)));
+        const int y0 = cy + static_cast<int>(std::lround(sin_a * (body_r - 2)));
+        const int x1 = cx + static_cast<int>(std::lround(cos_a * tooth_r));
+        const int y1 = cy + static_cast<int>(std::lround(sin_a * tooth_r));
+        draw_line(buffer, width, height, x0, y0, x1, y1, tooth_w, value);
     }
 
-    draw_arc(buffer, width, height, cx, cy, inner + 4, 0.0, kPi * 2.0, 3, value);
-    fill_rect(buffer, width, height, {cx - inner, cy - inner, inner * 2, inner * 2}, value);
-    fill_rect(buffer, width, height, {cx - 5, cy - 5, 10, 10}, active_theme().white);
+    // Solid circular body using filled arcs at multiple radii.
+    for (int r = body_r; r >= 1; --r) {
+        draw_arc(buffer, width, height, cx, cy, r, 0.0, kPi * 2.0, 1, value);
+    }
+
+    // Center hole.
+    for (int r = hole_r; r >= 1; --r) {
+        draw_arc(buffer, width, height, cx, cy, r, 0.0, kPi * 2.0, 1,
+                 active_theme().white);
+    }
+    fill_rect(buffer, width, height,
+              {cx - hole_r, cy - hole_r, hole_r * 2, hole_r * 2},
+              active_theme().white);
 }
 
 void draw_wifi_icon(RenderBuffer& buffer,

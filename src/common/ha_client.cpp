@@ -348,10 +348,10 @@ LightState parse_light_state(const json::Value& value) {
             }
         }
 
+        // Some color-temperature-only lights expose a derived rgb_color for their
+        // current white point. Keep the value for display, but do not treat it as
+        // proof that the light actually supports RGB control.
         parse_rgb(attributes_value->get("rgb_color"), light.rgb_red, light.rgb_green, light.rgb_blue);
-        if (light.rgb_red != 255 || light.rgb_green != 255 || light.rgb_blue != 255) {
-            light.supports_rgb = true;
-        }
     }
 
     if (light.supports_color_temp && light.min_color_temp_kelvin > light.max_color_temp_kelvin) {
