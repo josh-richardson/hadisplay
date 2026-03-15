@@ -1,5 +1,7 @@
 #include "system_status.h"
 
+#include "logger.h"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -165,6 +167,8 @@ struct DeviceStatus::Impl {
     bool battery_discovered = false;
     std::string wifi_interface;
     bool wifi_discovered = false;
+    bool last_wifi_connected = true;
+    bool wifi_state_logged = false;
     std::string last_error;
 
     void ensure_brightness_channels() {
@@ -396,9 +400,14 @@ struct DeviceStatus::Impl {
         ensure_wifi_interface();
         const std::string iface = wifi_interface.empty() ? "wlan0" : wifi_interface;
 
-        // Try wpa_cli reconnect first (lightweight).
+        log_warn("WiFi disconnected on " + iface + ", attempting wpa_cli reconnect");
         const std::string reconnect_cmd = "wpa_cli -i " + iface + " reconnect >/dev/null 2>&1";
-        std::system(reconnect_cmd.c_str());
+        const int rc = std::system(reconnect_cmd.c_str());
+        if (rc == 0) {
+            log_info("wpa_cli reconnect returned success");
+        } else {
+            log_warn("wpa_cli reconnect returned " + std::to_string(rc));
+        }
     }
 
     std::string read_battery_label() {
@@ -484,6 +493,15 @@ SystemStatus DeviceStatus::snapshot() {
     status.date_label = format_date_label();
     status.wifi_label = impl_->read_wifi_label();
     status.wifi_connected = status.wifi_label == "ON";
+    if (impl_->wifi_state_logged && status.wifi_connected != impl_->last_wifi_connected) {
+        if (status.wifi_connected) {
+            log_info("WiFi connected");
+        } else {
+            log_warn("WiFi lost");
+        }
+    }
+    impl_->last_wifi_connected = status.wifi_connected;
+    impl_->wifi_state_logged = true;
     status.battery_label = impl_->read_battery_label();
     status.battery_available = status.battery_label != "N/A";
     status.battery_charging = impl_->read_battery_charging();

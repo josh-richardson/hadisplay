@@ -32,7 +32,22 @@ fi
 
 # Disable WiFi driver-level power save to prevent disconnects.
 WIFI_IFACE="${INTERFACE:-wlan0}"
-iw "$WIFI_IFACE" set power_save off 2>/dev/null || iwconfig "$WIFI_IFACE" power off 2>/dev/null
+WIFI_LOG="${HADISPLAY_DIR}/hadisplay.log"
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] [keepalive] $1" >>"$WIFI_LOG"
+}
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] [keepalive] $1" >>"$WIFI_LOG"
+}
+
+if iw "$WIFI_IFACE" set power_save off 2>/dev/null; then
+    log_msg "WiFi power save disabled via iw"
+elif iwconfig "$WIFI_IFACE" power off 2>/dev/null; then
+    log_msg "WiFi power save disabled via iwconfig"
+else
+    log_warn "Failed to disable WiFi power save"
+fi
 
 # Background WiFi keepalive: pings the gateway every 60s to prevent
 # inactivity-based WiFi teardown, and attempts to reconnect if WiFi drops.
@@ -41,6 +56,7 @@ wifi_keepalive() {
         sleep 60
         # Check if the interface is still up.
         if ! ip link show "$WIFI_IFACE" up 2>/dev/null | grep -q "state UP"; then
+            log_warn "WiFi interface $WIFI_IFACE is down, attempting recovery"
             # Try to reload WiFi modules and reconnect.
             if [ -n "${WIFI_MODULE}" ]; then
                 insmod "/drivers/${PLATFORM}/wifi/sdio_wifi_pwr.ko" 2>/dev/null
@@ -51,11 +67,18 @@ wifi_keepalive() {
             wpa_cli -i "$WIFI_IFACE" reconnect 2>/dev/null
             sleep 5
             udhcpc -i "$WIFI_IFACE" -t 5 -q 2>/dev/null
+            if ip link show "$WIFI_IFACE" up 2>/dev/null | grep -q "state UP"; then
+                log_msg "WiFi recovery successful"
+            else
+                log_warn "WiFi recovery failed, will retry in 60s"
+            fi
         fi
         # Generate traffic to prevent inactivity timeout.
         GATEWAY=$(ip route | awk '/default/ {print $3}' | head -1)
         if [ -n "$GATEWAY" ]; then
-            ping -c 1 -W 5 "$GATEWAY" >/dev/null 2>&1
+            if ! ping -c 1 -W 5 "$GATEWAY" >/dev/null 2>&1; then
+                log_warn "Gateway ping failed ($GATEWAY)"
+            fi
         fi
     done
 }

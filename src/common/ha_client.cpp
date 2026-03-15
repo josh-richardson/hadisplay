@@ -1,12 +1,14 @@
 #include "ha_client.h"
 
 #include "json.h"
+#include "logger.h"
 
 #include <curl/curl.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -169,21 +171,43 @@ HttpResult http_request_json(const std::string& method,
         curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     }
 
+    const auto start_time = std::chrono::steady_clock::now();
     const CURLcode code = curl_easy_perform(curl);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
+    // Strip base URL prefix, keep just the API path for logging.
+    std::string log_path = url;
+    const auto api_pos = url.find("/api/");
+    if (api_pos != std::string::npos) {
+        log_path = url.substr(api_pos);
+    }
+
     if (code != CURLE_OK) {
+        std::ostringstream log;
+        log << "HTTP " << method << " " << log_path << " failed: " << curl_easy_strerror(code) << " (" << elapsed_ms << "ms)";
+        hadisplay::log_error(log.str());
         return {.ok = false, .http_code = http_code, .body = std::move(response), .message = curl_easy_strerror(code)};
     }
 
     if (http_code < 200 || http_code >= 300) {
         std::ostringstream oss;
         oss << "HA returned HTTP " << http_code;
+        std::ostringstream log;
+        log << "HTTP " << method << " " << log_path << " -> " << http_code << " (" << elapsed_ms << "ms)";
+        hadisplay::log_warn(log.str());
         return {.ok = false, .http_code = http_code, .body = std::move(response), .message = oss.str()};
+    }
+
+    {
+        std::ostringstream log;
+        log << "HTTP " << method << " " << log_path << " -> " << http_code << " (" << elapsed_ms << "ms, " << response.size() << "B)";
+        hadisplay::log_info(log.str());
     }
 
     return {.ok = true, .http_code = http_code, .body = std::move(response), .message = "OK"};

@@ -115,6 +115,7 @@ if(HADISPLAY_NEEDS_FBINK)
             src/common/app_config.cpp
             src/common/ha_client.cpp
             src/common/json.cpp
+            src/common/logger.cpp
             src/common/scene.cpp
             src/common/scene_draw.cpp
             src/common/scene_icons.cpp
@@ -163,6 +164,7 @@ if(HADISPLAY_NEEDS_FBINK)
             src/common/app_config.cpp
             src/common/ha_client.cpp
             src/common/json.cpp
+            src/common/logger.cpp
             src/common/scene.cpp
             src/common/scene_draw.cpp
             src/common/scene_icons.cpp

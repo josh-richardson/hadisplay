@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "ha_client.h"
+#include "logger.h"
 #include "scene.h"
 #include "system_status.h"
 
@@ -654,10 +655,12 @@ bool process_async_completions(AsyncState& async_state,
             }
             async_state.latest_entity_applied_epoch = refresh.epoch;
             if (!apply_entity_list_result(scene_state, refresh.list_result, selection_config_for_sync(scene_state, config))) {
+                hadisplay::log_warn("Entity refresh failed: " + refresh.list_result.message);
                 scene_state.status = concise_ha_error(refresh.list_result.message);
                 needs_redraw = true;
                 continue;
             }
+            hadisplay::log_info("Entity refresh: " + std::to_string(refresh.list_result.entities.size()) + " entities");
             scene_state.status = has_selected_entities(selection_config_for_sync(scene_state, config))
                 ? refresh.success_status
                 : refresh.empty_selection_status;
@@ -716,11 +719,13 @@ bool process_async_completions(AsyncState& async_state,
         }
         async_state.latest_entity_applied_epoch = action.epoch;
         if (!action.request_result.ok) {
+            hadisplay::log_warn("Entity action failed for " + action.entity_id + ": " + action.request_result.message);
             scene_state.status = concise_ha_error(action.request_result.message);
             needs_redraw = true;
             continue;
         }
         if (!action.updated_state.ok) {
+            hadisplay::log_warn("Entity state fetch failed for " + action.entity_id + ": " + action.updated_state.message);
             scene_state.status = concise_ha_error(action.updated_state.message);
             needs_redraw = true;
             continue;
@@ -1085,16 +1090,20 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
 }  // namespace
 
 int main() {
+    hadisplay::log_init({.path = "hadisplay.log"});
+
     FBInkConfig fbink_cfg{};
     fbink_cfg.is_quiet = true;
 
     const int fbfd = fbink_open();
     if (fbfd < 0) {
+        hadisplay::log_error("fbink_open failed");
         std::cerr << "fbink_open failed.\n";
         return EXIT_FAILURE;
     }
 
     if (fbink_init(fbfd, &fbink_cfg) < 0) {
+        hadisplay::log_error("fbink_init failed");
         std::cerr << "fbink_init failed.\n";
         fbink_close(fbfd);
         return EXIT_FAILURE;
@@ -1118,9 +1127,21 @@ int main() {
     const DisplaySettings display_settings = resolve_display_settings(fb_state, config.display_mode);
     bool config_dirty = false;
     if (!loaded_config.ok) {
+        hadisplay::log_warn("Config load failed, reset to defaults");
         scene_state.status = "CONFIG RESET";
     } else if (config.display_mode == hadisplay::DisplayMode::Color && !display_settings.has_color_panel) {
+        hadisplay::log_warn("Color mode requested but no color panel; falling back to grayscale");
         std::cerr << "Color mode requested but FBInk reports no color panel; falling back to grayscale.\n";
+    }
+
+    {
+        std::ostringstream startup;
+        startup << "Starting hadisplay: screen=" << scene_state.width << "x" << scene_state.height
+                << " display=" << (display_settings.effective_mode == hadisplay::DisplayMode::Color ? "color" : "grayscale")
+                << " entities=" << config.selected_entity_ids.size()
+                << " wifi=" << scene_state.wifi_label
+                << " battery=" << scene_state.battery_label;
+        hadisplay::log_info(startup.str());
     }
 
     ha::Client ha_client({
@@ -1132,6 +1153,7 @@ int main() {
     configure_async_mailbox(async_state);
 
     if (ha_client.configured()) {
+        hadisplay::log_info("HA client configured");
         if (has_selected_entities(config)) {
             scene_state.view_mode = hadisplay::ViewMode::Dashboard;
         } else {
@@ -1358,11 +1380,13 @@ int main() {
         }
     }
 
+    hadisplay::log_info("Shutting down");
     clear_screen(fbfd, true, display_settings);
     ioctl(touchfd, EVIOCGRAB, 0);
     close(touchfd);
     close_async_mailbox(async_state);
     fbink_close(fbfd);
     std::cerr << "hadisplay exiting.\n";
+    hadisplay::log_shutdown();
     return EXIT_SUCCESS;
 }

@@ -58,6 +58,7 @@ src/
     app_config.{h,cpp}
     ha_client.{h,cpp}
     json.{h,cpp}
+    logger.{h,cpp}
     scene.{h,cpp}
     scene_draw.{h,cpp}
     scene_icons.{h,cpp}
@@ -75,6 +76,7 @@ cmake/
   kobo-libs/
 scripts/
   deploy.sh
+  logs.sh
   run-hadisplay.sh
 docs/
   kobo-setup.md
@@ -186,6 +188,17 @@ Manual launch is useful for debugging, but it does not provide the normal Nickel
 - Screen: `1072x1448`
 - Wi-Fi and some runtime libraries depend on the Kobo environment inherited from Nickel and Kobo Stuff
 - `ForceWifi=true` in `[DeveloperSettings]` is still useful for keeping Wi-Fi alive
+
+## Logs
+
+The app writes structured logs to `hadisplay.log` on the device. Logs rotate automatically at 512KB (one backup kept).
+
+```bash
+./scripts/logs.sh              # full log
+./scripts/logs.sh -f           # tail/follow
+./scripts/logs.sh -n 50        # last 50 lines
+./scripts/logs.sh -n 50 -f    # follow from last 50
+```
 
 ## Related docs
 
