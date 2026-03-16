@@ -485,17 +485,6 @@ hadisplay::AppConfig selection_config_for_sync(const hadisplay::SceneState& scen
     return config_from_scene(scene_state, base_config);
 }
 
-std::vector<std::string> pattern_options_for_scene(const hadisplay::SceneState& scene_state) {
-    std::vector<std::string> options = hadisplay::default_hidden_entity_patterns();
-    std::set<std::string> seen(options.begin(), options.end());
-    for (const std::string& pattern : scene_state.hidden_entity_patterns) {
-        if (!pattern.empty() && seen.insert(pattern).second) {
-            options.push_back(pattern);
-        }
-    }
-    return options;
-}
-
 hadisplay::SetupTypeFilter next_setup_type_filter(hadisplay::SetupTypeFilter filter) {
     switch (filter) {
         case hadisplay::SetupTypeFilter::All: return hadisplay::SetupTypeFilter::Lights;
@@ -915,36 +904,6 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             scene_state.status = "ROOM DEVICES";
             needs_redraw = true;
             return false;
-        case hadisplay::ButtonId::SetupShowPatterns:
-            if (scene_state.view_mode == hadisplay::ViewMode::SetupPatterns) {
-                scene_state.view_mode = hadisplay::ViewMode::Setup;
-                scene_state.setup_page = 0;
-                scene_state.status = "SETUP VIEW";
-            } else {
-                scene_state.view_mode = hadisplay::ViewMode::SetupPatterns;
-                scene_state.setup_page = 0;
-                scene_state.status = "PATTERN RULES";
-            }
-            needs_redraw = true;
-            return false;
-        case hadisplay::ButtonId::SetupTogglePattern: {
-            const std::vector<std::string> options = pattern_options_for_scene(scene_state);
-            if (action_button.value < 0 || action_button.value >= static_cast<int>(options.size())) {
-                return false;
-            }
-            const std::string& pattern = options[static_cast<std::size_t>(action_button.value)];
-            auto existing = std::find(scene_state.hidden_entity_patterns.begin(), scene_state.hidden_entity_patterns.end(), pattern);
-            if (existing == scene_state.hidden_entity_patterns.end()) {
-                scene_state.hidden_entity_patterns.push_back(pattern);
-                scene_state.status = "PATTERN ENABLED";
-            } else {
-                scene_state.hidden_entity_patterns.erase(existing);
-                scene_state.status = "PATTERN DISABLED";
-            }
-            config_dirty = true;
-            needs_redraw = true;
-            return false;
-        }
         case hadisplay::ButtonId::SetupCycleBrowseMode:
             if (scene_state.setup_browse_mode == hadisplay::SetupBrowseMode::Rooms && !scene_state.setup_room_label.empty()) {
                 scene_state.setup_room_label.clear();
@@ -990,7 +949,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             } else {
                 config_dirty = false;
                 scene_state.status = "CONFIG SAVED";
-                if (scene_state.view_mode != hadisplay::ViewMode::SetupPatterns && !config.selected_entity_ids.empty()) {
+                if (!config.selected_entity_ids.empty()) {
                     scene_state.view_mode = hadisplay::ViewMode::Dashboard;
                     scene_state.dashboard_page = 0;
                 }

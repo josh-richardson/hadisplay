@@ -1,4 +1,3 @@
-#include "app_config.h"
 #include "scene.h"
 
 #include "scene_draw.h"
@@ -161,17 +160,6 @@ std::string setup_type_filter_label(SetupTypeFilter filter) {
         case SetupTypeFilter::Sensors: return "SENSORS";
     }
     return "ALL";
-}
-
-std::vector<std::string> setup_pattern_options(const SceneState& state) {
-    std::vector<std::string> options = default_hidden_entity_patterns();
-    std::set<std::string> seen(options.begin(), options.end());
-    for (const std::string& pattern : state.hidden_entity_patterns) {
-        if (!pattern.empty() && seen.insert(pattern).second) {
-            options.push_back(pattern);
-        }
-    }
-    return options;
 }
 
 std::vector<int> selected_entity_indices(const SceneState& state) {
@@ -735,7 +723,7 @@ void draw_setup_view(RenderBuffer& buffer,
                                       state.height,
                                       layout.body,
                                       layout.body.y + (layout.body.height / 2) + 24,
-                                      "CHANGE TYPE OR RULES",
+                                      "CHANGE TYPE OR CONFIG",
                                       2,
                                       kMid);
             return;
@@ -818,7 +806,7 @@ void draw_setup_view(RenderBuffer& buffer,
                                   state.height,
                                   layout.body,
                                   layout.body.y + (layout.body.height / 2) + 24,
-                                  "CHANGE TYPE OR RULES",
+                                  "CHANGE TYPE OR CONFIG",
                                   2,
                                   kMid);
         return;
@@ -877,74 +865,6 @@ void draw_setup_view(RenderBuffer& buffer,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.state_label), 2, 148),
                          2,
                          pressed ? kWhite : kDark);
-    }
-}
-
-void draw_setup_patterns_view(RenderBuffer& buffer,
-                              const SceneState& state,
-                              const scene::SceneLayout& layout,
-                              const std::vector<Button>& buttons) {
-    const std::vector<std::string> patterns = setup_pattern_options(state);
-    const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(patterns.size()), kSetupPageSize));
-    const int start = page * kSetupPageSize;
-    const int count = std::min(kSetupPageSize, static_cast<int>(patterns.size()) - start);
-    const int gutter = 18;
-    const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
-
-    draw_header(buffer,
-                state.width,
-                state.height,
-                layout,
-                "HIDDEN PATTERNS",
-                std::to_string(static_cast<int>(state.hidden_entity_patterns.size())) + " ENABLED",
-                state.status);
-
-    if (patterns.empty()) {
-        scene::draw_text_centered(buffer,
-                                  state.width,
-                                  state.height,
-                                  layout.body,
-                                  layout.body.y + (layout.body.height / 2) - 24,
-                                  "NO PATTERNS AVAILABLE",
-                                  3,
-                                  kDark);
-        return;
-    }
-
-    for (int i = 0; i < count; ++i) {
-        const std::string& pattern = patterns[static_cast<std::size_t>(start + i)];
-        const Rect row{
-            layout.body.x,
-            layout.body.y + (i * (row_height + gutter)),
-            layout.body.width,
-            row_height,
-        };
-        int button_index = -1;
-        find_button(buttons, ButtonId::SetupTogglePattern, start + i, &button_index);
-        const bool pressed = button_index == state.pressed_button;
-        const bool selected = button_index == state.selected_button;
-        draw_button_frame(buffer, state.width, state.height, row, pressed, selected);
-
-        const Rect checkbox{row.x + 18, row.y + (row.height / 2) - 16, 32, 32};
-        const bool enabled = std::find(state.hidden_entity_patterns.begin(), state.hidden_entity_patterns.end(), pattern) != state.hidden_entity_patterns.end();
-        draw_checkbox(buffer, state.width, state.height, checkbox, enabled);
-
-        scene::draw_text(buffer,
-                         state.width,
-                         state.height,
-                         row.x + 72,
-                         row.y + 18,
-                         scene::fit_text_to_width(scene::uppercase_ascii(pattern), 3, row.width - 96),
-                         3,
-                         pressed ? kWhite : kDark);
-        scene::draw_text(buffer,
-                         state.width,
-                         state.height,
-                         row.x + 72,
-                         row.y + row.height - 54,
-                         enabled ? "MATCHES ARE HIDDEN" : "MATCHES REMAIN VISIBLE",
-                         2,
-                         pressed ? kLight : kMid);
     }
 }
 
@@ -1311,7 +1231,6 @@ void draw_footer_buttons(RenderBuffer& buffer,
             case ButtonId::DevModeToggle:
             case ButtonId::SetupToggleLight:
             case ButtonId::SetupOpenRoom:
-            case ButtonId::SetupTogglePattern:
             case ButtonId::DashboardToggleLight:
             case ButtonId::DashboardOpenDetail:
             case ButtonId::DetailToggleLight:
@@ -1350,7 +1269,7 @@ std::vector<Button> buttons_for(const SceneState& state) {
 
     if (state.view_mode == ViewMode::Setup) {
         const bool room_list_view = state.setup_browse_mode == SetupBrowseMode::Rooms && state.setup_room_label.empty();
-        const int header_control_count = 3;
+        const int header_control_count = 2;
         const int footer_count = 4;
         const int gutter = 18;
         if (room_list_view) {
@@ -1381,39 +1300,16 @@ std::vector<Button> buttons_for(const SceneState& state) {
                 });
             }
         }
-        buttons.push_back({.id = ButtonId::SetupShowPatterns, .label = "RULES", .rect = setup_header_button_rect(layout, 0, header_control_count)});
         buttons.push_back({.id = ButtonId::SetupCycleBrowseMode,
                            .label = state.setup_browse_mode == SetupBrowseMode::List ? "ROOMS" : (state.setup_room_label.empty() ? "LIST" : "BACK"),
-                           .rect = setup_header_button_rect(layout, 1, header_control_count)});
+                           .rect = setup_header_button_rect(layout, 0, header_control_count)});
         buttons.push_back({.id = ButtonId::SetupCycleTypeFilter,
                            .label = setup_type_filter_label(state.setup_type_filter),
-                           .rect = setup_header_button_rect(layout, 2, header_control_count)});
+                           .rect = setup_header_button_rect(layout, 1, header_control_count)});
         buttons.push_back({.id = ButtonId::SetupRefresh, .label = "REFRESH", .rect = footer_button_rect(layout, footer_count, 0)});
         buttons.push_back({.id = ButtonId::SetupPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, footer_count, 1)});
         buttons.push_back({.id = ButtonId::SetupNextPage, .label = "NEXT", .rect = footer_button_rect(layout, footer_count, 2)});
         buttons.push_back({.id = ButtonId::SetupSave, .label = "SAVE", .rect = footer_button_rect(layout, footer_count, 3)});
-        return buttons;
-    }
-
-    if (state.view_mode == ViewMode::SetupPatterns) {
-        const std::vector<std::string> patterns = setup_pattern_options(state);
-        const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(patterns.size()), kSetupPageSize));
-        const int start = page * kSetupPageSize;
-        const int count = std::min(kSetupPageSize, static_cast<int>(patterns.size()) - start);
-        const int gutter = 18;
-        const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
-        for (int i = 0; i < count; ++i) {
-            buttons.push_back({
-                .id = ButtonId::SetupTogglePattern,
-                .label = patterns[static_cast<std::size_t>(start + i)],
-                .rect = {layout.body.x, layout.body.y + (i * (row_height + gutter)), layout.body.width, row_height},
-                .value = start + i,
-            });
-        }
-        buttons.push_back({.id = ButtonId::SetupShowPatterns, .label = "BACK", .rect = footer_button_rect(layout, 4, 0)});
-        buttons.push_back({.id = ButtonId::SetupPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, 4, 1)});
-        buttons.push_back({.id = ButtonId::SetupNextPage, .label = "NEXT", .rect = footer_button_rect(layout, 4, 2)});
-        buttons.push_back({.id = ButtonId::SetupSave, .label = "SAVE", .rect = footer_button_rect(layout, 4, 3)});
         return buttons;
     }
 
@@ -1540,9 +1436,6 @@ RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& bu
     switch (state.view_mode) {
         case ViewMode::Setup:
             draw_setup_view(buffer, state, layout, buttons);
-            break;
-        case ViewMode::SetupPatterns:
-            draw_setup_patterns_view(buffer, state, layout, buttons);
             break;
         case ViewMode::Dashboard:
             draw_dashboard_view(buffer, state, layout, buttons);

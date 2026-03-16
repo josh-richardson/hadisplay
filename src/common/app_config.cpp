@@ -110,7 +110,10 @@ std::vector<std::string> default_hidden_entity_patterns() {
         "child lock",
         "child_lock",
         "childlock",
+        "child-lock",
         "lock child",
+        "parental lock",
+        "button lock",
     };
 }
 

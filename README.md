@@ -131,6 +131,15 @@ Example:
   "ha_token": "your_long_lived_access_token",
   "ha_weather_entity": "weather.forecast_home",
   "display_mode": "auto",
+  "hidden_entity_patterns": [
+    "child lock",
+    "child_lock",
+    "childlock",
+    "child-lock",
+    "lock child",
+    "parental lock",
+    "button lock"
+  ],
   "selected_entity_ids": [
     "light.kitchen",
     "switch.lamp_socket",
@@ -143,6 +152,7 @@ Behavior:
 
 - `ha_url`, `ha_token`, and `ha_weather_entity` are loaded at startup
 - `display_mode` accepts `auto`, `grayscale`, or `color`
+- `hidden_entity_patterns` is a list of case-insensitive substrings to exclude from the setup device list
 - selected dashboard entities are persisted back into the same file
 - if no config exists, the app can enumerate Home Assistant entities and let the user select what should appear on the dashboard
 

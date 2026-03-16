@@ -1,0 +1,13 @@
+{
+  "display_mode": "auto",
+  "hidden_entity_patterns": [
+    "child lock",
+    "child_lock",
+    "childlock",
+    "child-lock",
+    "lock child",
+    "parental lock",
+    "button lock"
+  ],
+  "selected_entity_ids": []
+}

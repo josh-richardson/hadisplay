@@ -19,8 +19,6 @@ enum class ButtonId {
     DevModeToggle,
     SetupToggleLight,
     SetupOpenRoom,
-    SetupShowPatterns,
-    SetupTogglePattern,
     SetupCycleBrowseMode,
     SetupCycleTypeFilter,
     SetupPreviousPage,
@@ -55,7 +53,6 @@ struct Button {
 
 enum class ViewMode {
     Setup = 0,
-    SetupPatterns,
     Dashboard,
     Detail,
 };
