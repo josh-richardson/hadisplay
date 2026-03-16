@@ -50,9 +50,13 @@ if(HADISPLAY_NEEDS_FBINK)
     endif()
 
     set(FBINK_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/FBInk-src")
+    set(FBINK_BUILD_BYPRODUCTS
+        "${FBINK_SOURCE_DIR}/Release/libfbink.a"
+    )
     set(FBINK_BUILD_COMMAND_PREFIX "")
     set(FBINK_PLATFORM_ARGS "LINUX=true")
     find_program(HADISPLAY_GIT NAMES git REQUIRED)
+    find_program(HADISPLAY_MAKE NAMES gmake make REQUIRED)
 
     get_filename_component(HADISPLAY_C_COMPILER_DIR "${CMAKE_C_COMPILER}" DIRECTORY)
     get_filename_component(HADISPLAY_C_COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
@@ -61,6 +65,9 @@ if(HADISPLAY_NEEDS_FBINK)
         set(FBINK_BUILD_COMMAND_PREFIX "env PATH='${HADISPLAY_C_COMPILER_DIR}:$ENV{PATH}' CROSS_TC='${FBINK_CROSS_TC}' ")
         if(FBINK_CROSS_TC MATCHES "kobo")
             set(FBINK_PLATFORM_ARGS "KOBO=true")
+            list(APPEND FBINK_BUILD_BYPRODUCTS
+                "${FBINK_SOURCE_DIR}/libi2c-staged/lib/libi2c.a"
+            )
         endif()
     endif()
 
@@ -72,9 +79,9 @@ if(HADISPLAY_NEEDS_FBINK)
         SOURCE_DIR "${FBINK_SOURCE_DIR}"
         CONFIGURE_COMMAND ""
         BUILD_IN_SOURCE TRUE
-        BUILD_COMMAND /bin/sh -lc "${FBINK_BUILD_COMMAND_PREFIX}${HADISPLAY_GIT} submodule update --init --recursive && ${FBINK_BUILD_COMMAND_PREFIX}${CMAKE_MAKE_PROGRAM} clean >/dev/null 2>&1 || true && ${FBINK_BUILD_COMMAND_PREFIX}${CMAKE_MAKE_PROGRAM} staticlib ${FBINK_PLATFORM_ARGS} MINIMAL=true DRAW=true FONTS=true IMAGE=true"
+        BUILD_COMMAND /bin/sh -lc "${FBINK_BUILD_COMMAND_PREFIX}${HADISPLAY_GIT} submodule update --init --recursive && ${FBINK_BUILD_COMMAND_PREFIX}${HADISPLAY_MAKE} clean >/dev/null 2>&1 || true && ${FBINK_BUILD_COMMAND_PREFIX}${HADISPLAY_MAKE} staticlib ${FBINK_PLATFORM_ARGS} MINIMAL=true DRAW=true FONTS=true IMAGE=true"
         INSTALL_COMMAND ""
-        BUILD_BYPRODUCTS "${FBINK_SOURCE_DIR}/Release/libfbink.a"
+        BUILD_BYPRODUCTS ${FBINK_BUILD_BYPRODUCTS}
     )
 
     file(MAKE_DIRECTORY "${FBINK_SOURCE_DIR}")

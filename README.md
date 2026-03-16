@@ -102,6 +102,16 @@ cmake -S . -B build-kobo \
 cmake --build build-kobo -j
 ```
 
+### macOS / toolchain-free Kobo build
+
+If the Kobo cross-toolchain is not installed locally, the project can build the Kobo target in Docker instead:
+
+```bash
+./scripts/build-kobo-in-docker.sh
+```
+
+This uses a Linux `amd64` container plus the published KOReader `kobo` toolchain archive and writes the binary to `build-kobo-docker/hadisplay`.
+
 ## Deploying
 
 ```bash
@@ -111,6 +121,8 @@ cmake --build build-kobo -j
 This will:
 
 - build the Kobo target
+  - uses the native KOReader toolchain when it is available locally
+  - otherwise falls back to the Docker-based Kobo build path, which is useful on macOS
 - copy `hadisplay` and `run-hadisplay.sh` to `/mnt/onboard/.adds/hadisplay/`
 - restart the app on the device
 - tail the device log

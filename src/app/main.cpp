@@ -100,6 +100,7 @@ struct EntityActionRequest {
     int value2 = 0;
     int value3 = 0;
     std::string text;
+    std::string previous_state;
     std::string success_status = "ENTITY UPDATED";
 };
 
@@ -624,6 +625,36 @@ void schedule_sensor_history(AsyncState& async_state, const ha::Client& ha_clien
     }).detach();
 }
 
+ha::EntityState fetch_entity_state_after_action(const ha::Client& ha_client, const EntityActionRequest& request) {
+    ha::EntityState latest = ha_client.fetch_entity_state(request.entity_id);
+    if (!latest.ok) {
+        return latest;
+    }
+
+    const bool should_wait_for_state_change =
+        !request.previous_state.empty() &&
+        (request.type == EntityActionType::ToggleLight ||
+         request.type == EntityActionType::ToggleSwitch ||
+         request.type == EntityActionType::SetClimateMode);
+
+    if (!should_wait_for_state_change || latest.state != request.previous_state) {
+        return latest;
+    }
+
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(75));
+        latest = ha_client.fetch_entity_state(request.entity_id);
+        if (!latest.ok) {
+            break;
+        }
+        if (latest.state != request.previous_state) {
+            break;
+        }
+    }
+
+    return latest;
+}
+
 bool schedule_entity_action(AsyncState& async_state, const ha::Client& ha_client, EntityActionRequest request) {
     if (async_state.entity_action_pending) {
         return false;
@@ -657,7 +688,7 @@ bool schedule_entity_action(AsyncState& async_state, const ha::Client& ha_client
 
         ha::EntityState updated_state;
         if (request_result.ok) {
-            updated_state = ha_client.fetch_entity_state(request.entity_id);
+            updated_state = fetch_entity_state_after_action(ha_client, request);
         } else {
             updated_state.entity_id = request.entity_id;
         }
@@ -863,15 +894,20 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                           hadisplay::AppConfig& config,
                           AsyncState& async_state,
                           bool& config_dirty,
-                          int button_index,
+                          const hadisplay::Button& action_button,
                           bool& needs_redraw,
                           bool& force_full_refresh) {
-    if (button_index < 0 || button_index >= static_cast<int>(buttons.size())) {
-        return false;
+    int selected_button_index = -1;
+    for (std::size_t i = 0; i < buttons.size(); ++i) {
+        if (buttons[i].id == action_button.id &&
+            buttons[i].value == action_button.value &&
+            buttons[i].label == action_button.label) {
+            selected_button_index = static_cast<int>(i);
+            break;
+        }
     }
 
-    scene_state.selected_button = button_index;
-    const hadisplay::Button action_button = buttons[static_cast<std::size_t>(button_index)];
+    scene_state.selected_button = selected_button_index;
 
     switch (action_button.id) {
         case hadisplay::ButtonId::BrightnessToggle: {
@@ -969,6 +1005,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 EntityActionRequest request{
                     .entity_id = entity.entity_id,
                     .text = {},
+                    .previous_state = entity.is_on ? "on" : "off",
                 };
                 if (entity.kind == hadisplay::EntityKind::Light) {
                     request.type = EntityActionType::ToggleLight;
@@ -976,6 +1013,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                     request.type = EntityActionType::ToggleSwitch;
                 } else {
                     request.type = EntityActionType::SetClimateMode;
+                    request.previous_state = entity.is_on ? "heat" : "off";
                     request.text = entity.is_on ? "off" : "heat";
                 }
                 if (schedule_entity_action(async_state, ha_client, std::move(request))) {
@@ -1047,6 +1085,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 EntityActionRequest request{
                     .entity_id = entity.entity_id,
                     .text = {},
+                    .previous_state = entity.is_on ? "on" : "off",
                 };
                 if (entity.kind == hadisplay::EntityKind::Light) {
                     request.type = EntityActionType::ToggleLight;
@@ -1054,6 +1093,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                     request.type = EntityActionType::ToggleSwitch;
                 } else {
                     request.type = EntityActionType::SetClimateMode;
+                    request.previous_state = entity.is_on ? "heat" : "off";
                     request.text = entity.is_on ? "off" : "heat";
                 }
                 if (schedule_entity_action(async_state, ha_client, std::move(request))) {
@@ -1265,7 +1305,7 @@ int main() {
     TouchState touch{};
     bool needs_redraw = false;
     bool force_full_refresh = false;
-    int pending_button = -1;
+    std::optional<hadisplay::Button> pending_button;
     auto now = std::chrono::steady_clock::now();
     auto next_clock_refresh = next_minute_deadline();
     auto next_light_refresh = now + kNormalLightPollInterval;
@@ -1328,7 +1368,7 @@ int main() {
                             map_touch_to_scene(touch.x, touch.y, scene_state.width, scene_state.height, sx, sy);
                             const int released_on = hadisplay::button_at(buttons, sx, sy);
                             if (scene_state.pressed_button >= 0 && scene_state.pressed_button == released_on) {
-                                pending_button = released_on;
+                                pending_button = buttons[static_cast<std::size_t>(released_on)];
                             }
                         }
                         scene_state.pressed_button = -1;
@@ -1397,7 +1437,7 @@ int main() {
             force_full_refresh = false;
         }
 
-        if (pending_button >= 0) {
+        if (pending_button.has_value()) {
             buttons = hadisplay::buttons_for(scene_state);
             const bool should_exit = handle_button_action(scene_state,
                                                           buttons,
@@ -1407,10 +1447,10 @@ int main() {
                                                           config,
                                                           async_state,
                                                           config_dirty,
-                                                          pending_button,
+                                                          *pending_button,
                                                           needs_redraw,
                                                           force_full_refresh);
-            pending_button = -1;
+            pending_button.reset();
             now = std::chrono::steady_clock::now();
             next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
             next_light_refresh = now + (scene_state.dev_mode ? kDevPollInterval : kNormalLightPollInterval);
