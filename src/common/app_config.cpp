@@ -2,8 +2,10 @@
 
 #include "json.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +15,34 @@
 
 namespace hadisplay {
 namespace {
+
+std::string lowercase_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::string trim(std::string value) {
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+std::vector<std::string> normalize_patterns(const std::vector<std::string>& patterns) {
+    std::vector<std::string> normalized;
+    std::set<std::string> deduped;
+    for (const std::string& pattern : patterns) {
+        const std::string candidate = lowercase_ascii(trim(pattern));
+        if (!candidate.empty() && deduped.insert(candidate).second) {
+            normalized.push_back(candidate);
+        }
+    }
+    return normalized;
+}
 
 DisplayMode parse_display_mode(const json::Value* value) {
     const std::string* mode = value != nullptr ? value->as_string_if() : nullptr;
@@ -75,10 +105,20 @@ std::filesystem::path resolve_config_path() {
 
 ConfigStore::ConfigStore() : path_(resolve_config_path().string()) {}
 
+std::vector<std::string> default_hidden_entity_patterns() {
+    return {
+        "child lock",
+        "child_lock",
+        "childlock",
+        "lock child",
+    };
+}
+
 ConfigLoadResult ConfigStore::load() const {
     ConfigLoadResult result;
     result.ok = true;
     result.path = path_;
+    result.config.hidden_entity_patterns = default_hidden_entity_patterns();
 
     if (path_.empty()) {
         result.ok = false;
@@ -131,6 +171,25 @@ ConfigLoadResult ConfigStore::load() const {
     }
     result.config.display_mode = parse_display_mode(parsed.value.get("display_mode"));
 
+    if (const json::Value* hidden_patterns = parsed.value.get("hidden_entity_patterns")) {
+        const json::Value::Array* patterns = hidden_patterns->as_array_if();
+        if (patterns == nullptr) {
+            result.ok = false;
+            result.message = "hidden_entity_patterns must be an array";
+            return result;
+        }
+
+        std::vector<std::string> configured_patterns;
+        configured_patterns.reserve(patterns->size());
+        for (const json::Value& entry : *patterns) {
+            const std::string* value = entry.as_string_if();
+            if (value != nullptr) {
+                configured_patterns.push_back(*value);
+            }
+        }
+        result.config.hidden_entity_patterns = normalize_patterns(configured_patterns);
+    }
+
     const json::Value* selected = parsed.value.get("selected_entity_ids");
     if (selected == nullptr) {
         selected = parsed.value.get("selected_light_ids");
@@ -169,15 +228,20 @@ bool ConfigStore::save(const AppConfig& config, std::string& error) const {
     }
 
     json::Value::Array ids;
+    json::Value::Array hidden_patterns;
     std::set<std::string> deduped;
     for (const std::string& id : config.selected_entity_ids) {
         if (!id.empty() && deduped.insert(id).second) {
             ids.emplace_back(id);
         }
     }
+    for (const std::string& pattern : normalize_patterns(config.hidden_entity_patterns)) {
+        hidden_patterns.emplace_back(pattern);
+    }
 
     json::Value::Object root_object{
         {"selected_entity_ids", json::Value(std::move(ids))},
+        {"hidden_entity_patterns", json::Value(std::move(hidden_patterns))},
     };
     if (!config.ha_url.empty()) {
         root_object["ha_url"] = json::Value(config.ha_url);

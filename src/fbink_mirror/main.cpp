@@ -164,6 +164,7 @@ hadisplay::SceneState sample_scene_state(int width, int height, bool color_mode)
             .numeric_value = 0.0,
             .device_class = {},
             .unit_label = {},
+            .room_label = "Office",
             .hvac_action = {},
         },
         {
@@ -179,6 +180,7 @@ hadisplay::SceneState sample_scene_state(int width, int height, bool color_mode)
             .numeric_value = 0.0,
             .device_class = {},
             .unit_label = {},
+            .room_label = "Living Room",
             .hvac_action = {},
         },
         {
@@ -199,6 +201,7 @@ hadisplay::SceneState sample_scene_state(int width, int height, bool color_mode)
             .numeric_value = 0.0,
             .device_class = {},
             .unit_label = {},
+            .room_label = "Hallway",
             .hvac_action = "heating",
         },
     };

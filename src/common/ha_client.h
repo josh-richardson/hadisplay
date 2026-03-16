@@ -47,6 +47,7 @@ struct EntityState {
     int current_temperature = 0;
     int target_temperature = 0;
     std::string hvac_action;
+    std::string area_name;
     std::string device_class;
     std::string unit_of_measurement;
     std::string state_class;

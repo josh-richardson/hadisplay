@@ -434,6 +434,7 @@ hadisplay::EntityItem entity_item_from_state(const ha::EntityState& entity, bool
     item.numeric_value = entity.numeric_value;
     item.device_class = entity.device_class;
     item.unit_label = entity.unit_of_measurement;
+    item.room_label = entity.area_name;
     item.hvac_action = entity.hvac_action;
     return item;
 }
@@ -458,7 +459,11 @@ std::optional<int> find_entity_index(const hadisplay::SceneState& scene_state, c
 
 void apply_entity_update(hadisplay::SceneState& scene_state, int entity_index, const ha::EntityState& entity_state) {
     const bool selected = scene_state.entities[static_cast<std::size_t>(entity_index)].selected;
+    const std::string room_label = scene_state.entities[static_cast<std::size_t>(entity_index)].room_label;
     scene_state.entities[static_cast<std::size_t>(entity_index)] = entity_item_from_state(entity_state, selected);
+    if (scene_state.entities[static_cast<std::size_t>(entity_index)].room_label.empty()) {
+        scene_state.entities[static_cast<std::size_t>(entity_index)].room_label = room_label;
+    }
 }
 
 hadisplay::AppConfig config_from_scene(const hadisplay::SceneState& scene_state, const hadisplay::AppConfig& base_config) {
@@ -469,6 +474,7 @@ hadisplay::AppConfig config_from_scene(const hadisplay::SceneState& scene_state,
             config.selected_entity_ids.push_back(entity.entity_id);
         }
     }
+    config.hidden_entity_patterns = scene_state.hidden_entity_patterns;
     return config;
 }
 
@@ -477,6 +483,36 @@ hadisplay::AppConfig selection_config_for_sync(const hadisplay::SceneState& scen
         return base_config;
     }
     return config_from_scene(scene_state, base_config);
+}
+
+std::vector<std::string> pattern_options_for_scene(const hadisplay::SceneState& scene_state) {
+    std::vector<std::string> options = hadisplay::default_hidden_entity_patterns();
+    std::set<std::string> seen(options.begin(), options.end());
+    for (const std::string& pattern : scene_state.hidden_entity_patterns) {
+        if (!pattern.empty() && seen.insert(pattern).second) {
+            options.push_back(pattern);
+        }
+    }
+    return options;
+}
+
+hadisplay::SetupTypeFilter next_setup_type_filter(hadisplay::SetupTypeFilter filter) {
+    switch (filter) {
+        case hadisplay::SetupTypeFilter::All: return hadisplay::SetupTypeFilter::Lights;
+        case hadisplay::SetupTypeFilter::Lights: return hadisplay::SetupTypeFilter::Switches;
+        case hadisplay::SetupTypeFilter::Switches: return hadisplay::SetupTypeFilter::Climate;
+        case hadisplay::SetupTypeFilter::Climate: return hadisplay::SetupTypeFilter::Sensors;
+        case hadisplay::SetupTypeFilter::Sensors: return hadisplay::SetupTypeFilter::All;
+    }
+    return hadisplay::SetupTypeFilter::All;
+}
+
+hadisplay::SetupBrowseMode next_setup_browse_mode(hadisplay::SetupBrowseMode mode) {
+    switch (mode) {
+        case hadisplay::SetupBrowseMode::List: return hadisplay::SetupBrowseMode::Rooms;
+        case hadisplay::SetupBrowseMode::Rooms: return hadisplay::SetupBrowseMode::List;
+    }
+    return hadisplay::SetupBrowseMode::List;
 }
 
 void populate_entities(hadisplay::SceneState& scene_state,
@@ -550,11 +586,18 @@ void schedule_entity_refresh(AsyncState& async_state,
     async_state.entity_refresh_pending = true;
     const std::uint64_t epoch = ++async_state.next_entity_epoch;
     const std::shared_ptr<AsyncMailbox> mailbox = async_state.mailbox;
+    hadisplay::log_info("Entity sync starting");
     std::thread([mailbox, ha_client, epoch, success_status, empty_selection_status]() mutable {
+        auto result = ha_client.list_entities();
+        if (result.ok) {
+            hadisplay::log_info("Entity sync complete: " + std::to_string(result.entities.size()) + " entities");
+        } else {
+            hadisplay::log_warn("Entity sync failed: " + result.message);
+        }
         post_async_completion(mailbox,
                               EntityRefreshCompletion{
                                   .epoch = epoch,
-                                  .list_result = ha_client.list_entities(),
+                                  .list_result = std::move(result),
                                   .success_status = success_status,
                                   .empty_selection_status = empty_selection_status,
                               });
@@ -866,6 +909,62 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 needs_redraw = true;
             }
             return false;
+        case hadisplay::ButtonId::SetupOpenRoom:
+            scene_state.setup_room_label = action_button.label;
+            scene_state.setup_page = 0;
+            scene_state.status = "ROOM DEVICES";
+            needs_redraw = true;
+            return false;
+        case hadisplay::ButtonId::SetupShowPatterns:
+            if (scene_state.view_mode == hadisplay::ViewMode::SetupPatterns) {
+                scene_state.view_mode = hadisplay::ViewMode::Setup;
+                scene_state.setup_page = 0;
+                scene_state.status = "SETUP VIEW";
+            } else {
+                scene_state.view_mode = hadisplay::ViewMode::SetupPatterns;
+                scene_state.setup_page = 0;
+                scene_state.status = "PATTERN RULES";
+            }
+            needs_redraw = true;
+            return false;
+        case hadisplay::ButtonId::SetupTogglePattern: {
+            const std::vector<std::string> options = pattern_options_for_scene(scene_state);
+            if (action_button.value < 0 || action_button.value >= static_cast<int>(options.size())) {
+                return false;
+            }
+            const std::string& pattern = options[static_cast<std::size_t>(action_button.value)];
+            auto existing = std::find(scene_state.hidden_entity_patterns.begin(), scene_state.hidden_entity_patterns.end(), pattern);
+            if (existing == scene_state.hidden_entity_patterns.end()) {
+                scene_state.hidden_entity_patterns.push_back(pattern);
+                scene_state.status = "PATTERN ENABLED";
+            } else {
+                scene_state.hidden_entity_patterns.erase(existing);
+                scene_state.status = "PATTERN DISABLED";
+            }
+            config_dirty = true;
+            needs_redraw = true;
+            return false;
+        }
+        case hadisplay::ButtonId::SetupCycleBrowseMode:
+            if (scene_state.setup_browse_mode == hadisplay::SetupBrowseMode::Rooms && !scene_state.setup_room_label.empty()) {
+                scene_state.setup_room_label.clear();
+                scene_state.setup_page = 0;
+                scene_state.status = "ROOM LIST";
+                needs_redraw = true;
+                return false;
+            }
+            scene_state.setup_browse_mode = next_setup_browse_mode(scene_state.setup_browse_mode);
+            scene_state.setup_room_label.clear();
+            scene_state.setup_page = 0;
+            scene_state.status = scene_state.setup_browse_mode == hadisplay::SetupBrowseMode::Rooms ? "ROOM VIEW" : "LIST VIEW";
+            needs_redraw = true;
+            return false;
+        case hadisplay::ButtonId::SetupCycleTypeFilter:
+            scene_state.setup_type_filter = next_setup_type_filter(scene_state.setup_type_filter);
+            scene_state.setup_page = 0;
+            scene_state.status = "TYPE FILTER UPDATED";
+            needs_redraw = true;
+            return false;
         case hadisplay::ButtonId::SetupPreviousPage:
             scene_state.setup_page = std::max(0, scene_state.setup_page - 1);
             needs_redraw = true;
@@ -891,7 +990,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             } else {
                 config_dirty = false;
                 scene_state.status = "CONFIG SAVED";
-                if (!config.selected_entity_ids.empty()) {
+                if (scene_state.view_mode != hadisplay::ViewMode::SetupPatterns && !config.selected_entity_ids.empty()) {
                     scene_state.view_mode = hadisplay::ViewMode::Dashboard;
                     scene_state.dashboard_page = 0;
                 }
@@ -1126,6 +1225,7 @@ int main() {
     hadisplay::AppConfig config = loaded_config.config;
     const DisplaySettings display_settings = resolve_display_settings(fb_state, config.display_mode);
     bool config_dirty = false;
+    scene_state.hidden_entity_patterns = config.hidden_entity_patterns;
     if (!loaded_config.ok) {
         hadisplay::log_warn("Config load failed, reset to defaults");
         scene_state.status = "CONFIG RESET";

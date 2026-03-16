@@ -54,8 +54,13 @@ fi
 wifi_keepalive() {
     while true; do
         sleep 60
-        # Check if the interface is still up.
-        if ! ip link show "$WIFI_IFACE" up 2>/dev/null | grep -q "state UP"; then
+        # Check if the interface is still up (driver may report UP, UNKNOWN, or DORMANT).
+        IFACE_STATE=$(cat "/sys/class/net/$WIFI_IFACE/operstate" 2>/dev/null)
+        case "$IFACE_STATE" in
+            up|unknown|dormant) WIFI_OK=true ;;
+            *) WIFI_OK=false ;;
+        esac
+        if [ "$WIFI_OK" = false ]; then
             log_warn "WiFi interface $WIFI_IFACE is down, attempting recovery"
             # Try to reload WiFi modules and reconnect.
             if [ -n "${WIFI_MODULE}" ]; then
@@ -67,7 +72,9 @@ wifi_keepalive() {
             wpa_cli -i "$WIFI_IFACE" reconnect 2>/dev/null
             sleep 5
             udhcpc -i "$WIFI_IFACE" -t 5 -q 2>/dev/null
-            if ip link show "$WIFI_IFACE" up 2>/dev/null | grep -q "state UP"; then
+            IFACE_STATE=$(cat "/sys/class/net/$WIFI_IFACE/operstate" 2>/dev/null)
+            case "$IFACE_STATE" in up|unknown|dormant) RECOVER_OK=true ;; *) RECOVER_OK=false ;; esac
+            if [ "$RECOVER_OK" = true ]; then
                 log_msg "WiFi recovery successful"
             else
                 log_warn "WiFi recovery failed, will retry in 60s"

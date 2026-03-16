@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "scene.h"
 
 #include "scene_draw.h"
@@ -6,8 +7,10 @@
 #include "scene_style.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -42,6 +45,135 @@ int selected_entity_count(const SceneState& state) {
     }));
 }
 
+int max_page_index(int item_count, int page_size) {
+    if (item_count <= 0) {
+        return 0;
+    }
+    return std::max(0, (item_count - 1) / page_size);
+}
+
+std::string lowercase_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::string setup_room_name_for_entity(const EntityItem& entity) {
+    return entity.room_label.empty() ? "UNASSIGNED" : entity.room_label;
+}
+
+std::string uppercase_room_name_for_entity(const EntityItem& entity) {
+    return scene::uppercase_ascii(setup_room_name_for_entity(entity));
+}
+
+bool matches_setup_type_filter(const EntityItem& entity, SetupTypeFilter filter) {
+    switch (filter) {
+        case SetupTypeFilter::All: return true;
+        case SetupTypeFilter::Lights: return entity.kind == EntityKind::Light;
+        case SetupTypeFilter::Switches: return entity.kind == EntityKind::Switch;
+        case SetupTypeFilter::Climate: return entity.kind == EntityKind::Climate;
+        case SetupTypeFilter::Sensors: return entity.kind == EntityKind::Sensor;
+    }
+    return true;
+}
+
+bool matches_hidden_patterns(const EntityItem& entity, const std::vector<std::string>& patterns) {
+    if (patterns.empty()) {
+        return false;
+    }
+
+    const std::string haystack = lowercase_ascii(entity.entity_id + "\n" + entity.name + "\n" + setup_room_name_for_entity(entity));
+    for (const std::string& pattern : patterns) {
+        if (!pattern.empty() && haystack.find(lowercase_ascii(pattern)) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<int> filtered_setup_entity_indices(const SceneState& state) {
+    std::vector<int> indices;
+    for (std::size_t i = 0; i < state.entities.size(); ++i) {
+        const EntityItem& entity = state.entities[i];
+        if (!matches_setup_type_filter(entity, state.setup_type_filter)) {
+            continue;
+        }
+        if (matches_hidden_patterns(entity, state.hidden_entity_patterns)) {
+            continue;
+        }
+        if (state.setup_browse_mode == SetupBrowseMode::Rooms &&
+            !state.setup_room_label.empty() &&
+            setup_room_name_for_entity(entity) != state.setup_room_label) {
+            continue;
+        }
+        indices.push_back(static_cast<int>(i));
+    }
+
+    std::sort(indices.begin(), indices.end(), [&](int left_index, int right_index) {
+        const EntityItem& left = state.entities[static_cast<std::size_t>(left_index)];
+        const EntityItem& right = state.entities[static_cast<std::size_t>(right_index)];
+        if (state.setup_browse_mode == SetupBrowseMode::List) {
+            if (left.kind != right.kind) {
+                return static_cast<int>(left.kind) < static_cast<int>(right.kind);
+            }
+        }
+        return lowercase_ascii(left.name) < lowercase_ascii(right.name);
+    });
+    return indices;
+}
+
+std::vector<std::string> filtered_setup_rooms(const SceneState& state) {
+    std::vector<std::string> rooms;
+    std::set<std::string> seen;
+    for (int entity_index : filtered_setup_entity_indices(state)) {
+        const std::string room = setup_room_name_for_entity(state.entities[static_cast<std::size_t>(entity_index)]);
+        if (seen.insert(room).second) {
+            rooms.push_back(room);
+        }
+    }
+    std::sort(rooms.begin(), rooms.end(), [](const std::string& left, const std::string& right) {
+        return lowercase_ascii(left) < lowercase_ascii(right);
+    });
+    return rooms;
+}
+
+std::vector<int> setup_page_entity_indices(const SceneState& state) {
+    const std::vector<int> filtered = filtered_setup_entity_indices(state);
+    const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(filtered.size()), kSetupPageSize));
+    const int start = page * kSetupPageSize;
+    const int count = std::min(kSetupPageSize, static_cast<int>(filtered.size()) - start);
+
+    std::vector<int> page_entities;
+    page_entities.reserve(std::max(0, count));
+    for (int i = 0; i < count; ++i) {
+        page_entities.push_back(filtered[static_cast<std::size_t>(start + i)]);
+    }
+    return page_entities;
+}
+
+std::string setup_type_filter_label(SetupTypeFilter filter) {
+    switch (filter) {
+        case SetupTypeFilter::All: return "ALL";
+        case SetupTypeFilter::Lights: return "LIGHTS";
+        case SetupTypeFilter::Switches: return "SWITCHES";
+        case SetupTypeFilter::Climate: return "CLIMATE";
+        case SetupTypeFilter::Sensors: return "SENSORS";
+    }
+    return "ALL";
+}
+
+std::vector<std::string> setup_pattern_options(const SceneState& state) {
+    std::vector<std::string> options = default_hidden_entity_patterns();
+    std::set<std::string> seen(options.begin(), options.end());
+    for (const std::string& pattern : state.hidden_entity_patterns) {
+        if (!pattern.empty() && seen.insert(pattern).second) {
+            options.push_back(pattern);
+        }
+    }
+    return options;
+}
+
 std::vector<int> selected_entity_indices(const SceneState& state) {
     std::vector<int> indices;
     for (std::size_t i = 0; i < state.entities.size(); ++i) {
@@ -52,13 +184,6 @@ std::vector<int> selected_entity_indices(const SceneState& state) {
     return indices;
 }
 
-int max_page_index(int item_count, int page_size) {
-    if (item_count <= 0) {
-        return 0;
-    }
-    return std::max(0, (item_count - 1) / page_size);
-}
-
 Rect footer_button_rect(const scene::SceneLayout& layout, int count, int index) {
     const int gutter = 18;
     const int width = (layout.footer.width - ((count - 1) * gutter)) / count;
@@ -67,6 +192,20 @@ Rect footer_button_rect(const scene::SceneLayout& layout, int count, int index) 
         layout.footer.y,
         width,
         layout.footer.height,
+    };
+}
+
+Rect setup_header_button_rect(const scene::SceneLayout& layout, int index, int count) {
+    const int gutter = 14;
+    const int width = std::clamp((layout.header.width - 120 - ((count - 1) * gutter)) / std::max(1, count), 160, 210);
+    const int height = std::clamp(layout.header.height / 3, 40, 48);
+    const int total_width = (count * width) + ((count - 1) * gutter);
+    const int y = layout.header.y + layout.header.height - height - 6;
+    return {
+        layout.header.x + layout.header.width - total_width + (index * (width + gutter)),
+        y,
+        width,
+        height,
     };
 }
 
@@ -568,29 +707,125 @@ void draw_setup_view(RenderBuffer& buffer,
                      const SceneState& state,
                      const scene::SceneLayout& layout,
                      const std::vector<Button>& buttons) {
-    const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(state.entities.size()), kSetupPageSize));
-    const int start = page * kSetupPageSize;
-    const int count = std::min(kSetupPageSize, static_cast<int>(state.entities.size()) - start);
+    const std::vector<int> filtered_entities = filtered_setup_entity_indices(state);
+    const std::vector<std::string> filtered_rooms = filtered_setup_rooms(state);
     const int gutter = 18;
+    const bool room_list_view = state.setup_browse_mode == SetupBrowseMode::Rooms && state.setup_room_label.empty();
+
+    if (room_list_view) {
+        const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(filtered_rooms.size()), kSetupPageSize));
+        const int start = page * kSetupPageSize;
+        const int count = std::min(kSetupPageSize, static_cast<int>(filtered_rooms.size()) - start);
+        const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
+        const std::string subtitle = std::to_string(selected_entity_count(state)) + " SELECTED / " +
+                                     std::to_string(static_cast<int>(filtered_rooms.size())) + " ROOMS";
+        draw_header(buffer, state.width, state.height, layout, "SELECT BY ROOM", subtitle, state.status);
+
+        if (filtered_rooms.empty()) {
+            scene::draw_text_centered(buffer,
+                                      state.width,
+                                      state.height,
+                                      layout.body,
+                                      layout.body.y + (layout.body.height / 2) - 24,
+                                      "NO ROOMS MATCH FILTERS",
+                                      3,
+                                      kDark);
+            scene::draw_text_centered(buffer,
+                                      state.width,
+                                      state.height,
+                                      layout.body,
+                                      layout.body.y + (layout.body.height / 2) + 24,
+                                      "CHANGE TYPE OR RULES",
+                                      2,
+                                      kMid);
+            return;
+        }
+
+        for (int i = 0; i < count; ++i) {
+            const std::string& room = filtered_rooms[static_cast<std::size_t>(start + i)];
+            const Rect row{
+                layout.body.x,
+                layout.body.y + (i * (row_height + gutter)),
+                layout.body.width,
+                row_height,
+            };
+            int button_index = -1;
+            find_button(buttons, ButtonId::SetupOpenRoom, start + i, &button_index);
+            const bool pressed = button_index == state.pressed_button;
+            const bool selected = button_index == state.selected_button;
+            draw_button_frame(buffer, state.width, state.height, row, pressed, selected);
+
+            int total_in_room = 0;
+            int selected_in_room = 0;
+            for (int entity_index : filtered_entities) {
+                const EntityItem& entity = state.entities[static_cast<std::size_t>(entity_index)];
+                if (setup_room_name_for_entity(entity) != room) {
+                    continue;
+                }
+                ++total_in_room;
+                if (entity.selected) {
+                    ++selected_in_room;
+                }
+            }
+
+            scene::draw_text(buffer,
+                             state.width,
+                             state.height,
+                             row.x + 24,
+                             row.y + 18,
+                             scene::fit_text_to_width(scene::uppercase_ascii(room), 3, row.width - 48),
+                             3,
+                             pressed ? kWhite : kDark);
+            scene::draw_text(buffer,
+                             state.width,
+                             state.height,
+                             row.x + 24,
+                             row.y + row.height - 54,
+                             scene::fit_text_to_width(std::to_string(total_in_room) + " DEVICES", 2, (row.width / 2) - 32),
+                             2,
+                             pressed ? kLight : kMid);
+            scene::draw_text(buffer,
+                             state.width,
+                             state.height,
+                             row.x + row.width - 220,
+                             row.y + row.height - 54,
+                             scene::fit_text_to_width(std::to_string(selected_in_room) + "/" + std::to_string(total_in_room) + " SELECTED", 2, 200),
+                             2,
+                             pressed ? kWhite : kDark);
+        }
+        return;
+    }
+
+    const std::vector<int> page_entities = setup_page_entity_indices(state);
+    const int count = static_cast<int>(page_entities.size());
     const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
+    const std::string title = state.setup_room_label.empty() ? "SELECT DEVICES" : state.setup_room_label;
+    const std::string subtitle = std::to_string(selected_entity_count(state)) + " SELECTED / " +
+                                 std::to_string(static_cast<int>(filtered_entities.size())) + " SHOWN";
+    draw_header(buffer, state.width, state.height, layout, title, subtitle, state.status);
 
-    const std::string subtitle = std::to_string(selected_entity_count(state)) + " SELECTED";
-    draw_header(buffer, state.width, state.height, layout, "SELECT DEVICES", subtitle, state.status);
-
-    if (state.entities.empty()) {
+    if (page_entities.empty()) {
         scene::draw_text_centered(buffer,
                                   state.width,
                                   state.height,
                                   layout.body,
                                   layout.body.y + (layout.body.height / 2) - 24,
-                                  "NO DEVICES FOUND",
+                                  "NO DEVICES MATCH FILTERS",
                                   3,
                                   kDark);
+        scene::draw_text_centered(buffer,
+                                  state.width,
+                                  state.height,
+                                  layout.body,
+                                  layout.body.y + (layout.body.height / 2) + 24,
+                                  "CHANGE TYPE OR RULES",
+                                  2,
+                                  kMid);
         return;
     }
 
     for (int i = 0; i < count; ++i) {
-        const int entity_index = start + i;
+        const int entity_index = page_entities[static_cast<std::size_t>(i)];
         const EntityItem& entity = state.entities[static_cast<std::size_t>(entity_index)];
         const Rect row{
             layout.body.x,
@@ -619,9 +854,9 @@ void draw_setup_view(RenderBuffer& buffer,
         scene::draw_text(buffer,
                          state.width,
                          state.height,
-                         row.x + row.width - 150,
+                         row.x + row.width - 220,
                          row.y + 18,
-                         scene::fit_text_to_width(scene::uppercase_ascii(entity.kind_label), 2, 132),
+                         scene::fit_text_to_width(scene::uppercase_ascii(state.setup_room_label.empty() ? uppercase_room_name_for_entity(entity) : entity.kind_label), 2, 202),
                          2,
                          pressed ? kLight : kMid);
 
@@ -642,6 +877,74 @@ void draw_setup_view(RenderBuffer& buffer,
                          scene::fit_text_to_width(scene::uppercase_ascii(entity.state_label), 2, 148),
                          2,
                          pressed ? kWhite : kDark);
+    }
+}
+
+void draw_setup_patterns_view(RenderBuffer& buffer,
+                              const SceneState& state,
+                              const scene::SceneLayout& layout,
+                              const std::vector<Button>& buttons) {
+    const std::vector<std::string> patterns = setup_pattern_options(state);
+    const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(patterns.size()), kSetupPageSize));
+    const int start = page * kSetupPageSize;
+    const int count = std::min(kSetupPageSize, static_cast<int>(patterns.size()) - start);
+    const int gutter = 18;
+    const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
+
+    draw_header(buffer,
+                state.width,
+                state.height,
+                layout,
+                "HIDDEN PATTERNS",
+                std::to_string(static_cast<int>(state.hidden_entity_patterns.size())) + " ENABLED",
+                state.status);
+
+    if (patterns.empty()) {
+        scene::draw_text_centered(buffer,
+                                  state.width,
+                                  state.height,
+                                  layout.body,
+                                  layout.body.y + (layout.body.height / 2) - 24,
+                                  "NO PATTERNS AVAILABLE",
+                                  3,
+                                  kDark);
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const std::string& pattern = patterns[static_cast<std::size_t>(start + i)];
+        const Rect row{
+            layout.body.x,
+            layout.body.y + (i * (row_height + gutter)),
+            layout.body.width,
+            row_height,
+        };
+        int button_index = -1;
+        find_button(buttons, ButtonId::SetupTogglePattern, start + i, &button_index);
+        const bool pressed = button_index == state.pressed_button;
+        const bool selected = button_index == state.selected_button;
+        draw_button_frame(buffer, state.width, state.height, row, pressed, selected);
+
+        const Rect checkbox{row.x + 18, row.y + (row.height / 2) - 16, 32, 32};
+        const bool enabled = std::find(state.hidden_entity_patterns.begin(), state.hidden_entity_patterns.end(), pattern) != state.hidden_entity_patterns.end();
+        draw_checkbox(buffer, state.width, state.height, checkbox, enabled);
+
+        scene::draw_text(buffer,
+                         state.width,
+                         state.height,
+                         row.x + 72,
+                         row.y + 18,
+                         scene::fit_text_to_width(scene::uppercase_ascii(pattern), 3, row.width - 96),
+                         3,
+                         pressed ? kWhite : kDark);
+        scene::draw_text(buffer,
+                         state.width,
+                         state.height,
+                         row.x + 72,
+                         row.y + row.height - 54,
+                         enabled ? "MATCHES ARE HIDDEN" : "MATCHES REMAIN VISIBLE",
+                         2,
+                         pressed ? kLight : kMid);
     }
 }
 
@@ -1007,6 +1310,8 @@ void draw_footer_buttons(RenderBuffer& buffer,
             case ButtonId::BrightnessToggle:
             case ButtonId::DevModeToggle:
             case ButtonId::SetupToggleLight:
+            case ButtonId::SetupOpenRoom:
+            case ButtonId::SetupTogglePattern:
             case ButtonId::DashboardToggleLight:
             case ButtonId::DashboardOpenDetail:
             case ButtonId::DetailToggleLight:
@@ -1044,24 +1349,71 @@ std::vector<Button> buttons_for(const SceneState& state) {
     };
 
     if (state.view_mode == ViewMode::Setup) {
-        const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(state.entities.size()), kSetupPageSize));
+        const bool room_list_view = state.setup_browse_mode == SetupBrowseMode::Rooms && state.setup_room_label.empty();
+        const int header_control_count = 3;
+        const int footer_count = 4;
+        const int gutter = 18;
+        if (room_list_view) {
+            const std::vector<std::string> rooms = filtered_setup_rooms(state);
+            const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(rooms.size()), kSetupPageSize));
+            const int start = page * kSetupPageSize;
+            const int count = std::min(kSetupPageSize, static_cast<int>(rooms.size()) - start);
+            const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
+            for (int i = 0; i < count; ++i) {
+                buttons.push_back({
+                    .id = ButtonId::SetupOpenRoom,
+                    .label = rooms[static_cast<std::size_t>(start + i)],
+                    .rect = {layout.body.x, layout.body.y + (i * (row_height + gutter)), layout.body.width, row_height},
+                    .value = start + i,
+                });
+            }
+        } else {
+            const std::vector<int> page_entities = setup_page_entity_indices(state);
+            const int count = static_cast<int>(page_entities.size());
+            const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
+            for (int i = 0; i < count; ++i) {
+                const int entity_index = page_entities[static_cast<std::size_t>(i)];
+                buttons.push_back({
+                    .id = ButtonId::SetupToggleLight,
+                    .label = state.entities[static_cast<std::size_t>(entity_index)].name,
+                    .rect = {layout.body.x, layout.body.y + (i * (row_height + gutter)), layout.body.width, row_height},
+                    .value = entity_index,
+                });
+            }
+        }
+        buttons.push_back({.id = ButtonId::SetupShowPatterns, .label = "RULES", .rect = setup_header_button_rect(layout, 0, header_control_count)});
+        buttons.push_back({.id = ButtonId::SetupCycleBrowseMode,
+                           .label = state.setup_browse_mode == SetupBrowseMode::List ? "ROOMS" : (state.setup_room_label.empty() ? "LIST" : "BACK"),
+                           .rect = setup_header_button_rect(layout, 1, header_control_count)});
+        buttons.push_back({.id = ButtonId::SetupCycleTypeFilter,
+                           .label = setup_type_filter_label(state.setup_type_filter),
+                           .rect = setup_header_button_rect(layout, 2, header_control_count)});
+        buttons.push_back({.id = ButtonId::SetupRefresh, .label = "REFRESH", .rect = footer_button_rect(layout, footer_count, 0)});
+        buttons.push_back({.id = ButtonId::SetupPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, footer_count, 1)});
+        buttons.push_back({.id = ButtonId::SetupNextPage, .label = "NEXT", .rect = footer_button_rect(layout, footer_count, 2)});
+        buttons.push_back({.id = ButtonId::SetupSave, .label = "SAVE", .rect = footer_button_rect(layout, footer_count, 3)});
+        return buttons;
+    }
+
+    if (state.view_mode == ViewMode::SetupPatterns) {
+        const std::vector<std::string> patterns = setup_pattern_options(state);
+        const int page = std::clamp(state.setup_page, 0, max_page_index(static_cast<int>(patterns.size()), kSetupPageSize));
         const int start = page * kSetupPageSize;
-        const int count = std::min(kSetupPageSize, static_cast<int>(state.entities.size()) - start);
+        const int count = std::min(kSetupPageSize, static_cast<int>(patterns.size()) - start);
         const int gutter = 18;
         const int row_height = count > 0 ? (layout.body.height - ((count - 1) * gutter)) / std::max(1, count) : layout.body.height;
         for (int i = 0; i < count; ++i) {
             buttons.push_back({
-                .id = ButtonId::SetupToggleLight,
-                .label = state.entities[static_cast<std::size_t>(start + i)].name,
+                .id = ButtonId::SetupTogglePattern,
+                .label = patterns[static_cast<std::size_t>(start + i)],
                 .rect = {layout.body.x, layout.body.y + (i * (row_height + gutter)), layout.body.width, row_height},
                 .value = start + i,
             });
         }
-        buttons.push_back({.id = ButtonId::SetupRefresh, .label = "REFRESH", .rect = footer_button_rect(layout, 5, 0)});
-        buttons.push_back({.id = ButtonId::SetupPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, 5, 1)});
-        buttons.push_back({.id = ButtonId::SetupNextPage, .label = "NEXT", .rect = footer_button_rect(layout, 5, 2)});
-        buttons.push_back({.id = ButtonId::SetupSave, .label = "SAVE", .rect = footer_button_rect(layout, 5, 3)});
-        buttons.push_back({.id = ButtonId::Exit, .label = "EXIT", .rect = footer_button_rect(layout, 5, 4)});
+        buttons.push_back({.id = ButtonId::SetupShowPatterns, .label = "BACK", .rect = footer_button_rect(layout, 4, 0)});
+        buttons.push_back({.id = ButtonId::SetupPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, 4, 1)});
+        buttons.push_back({.id = ButtonId::SetupNextPage, .label = "NEXT", .rect = footer_button_rect(layout, 4, 2)});
+        buttons.push_back({.id = ButtonId::SetupSave, .label = "SAVE", .rect = footer_button_rect(layout, 4, 3)});
         return buttons;
     }
 
@@ -1188,6 +1540,9 @@ RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& bu
     switch (state.view_mode) {
         case ViewMode::Setup:
             draw_setup_view(buffer, state, layout, buttons);
+            break;
+        case ViewMode::SetupPatterns:
+            draw_setup_patterns_view(buffer, state, layout, buttons);
             break;
         case ViewMode::Dashboard:
             draw_dashboard_view(buffer, state, layout, buttons);

@@ -7,11 +7,14 @@
 
 namespace hadisplay {
 
+std::vector<std::string> default_hidden_entity_patterns();
+
 struct AppConfig {
     std::string ha_url;
     std::string ha_token;
     std::string ha_weather_entity;
     std::vector<std::string> selected_entity_ids;
+    std::vector<std::string> hidden_entity_patterns = default_hidden_entity_patterns();
     DisplayMode display_mode = DisplayMode::Auto;
 };
 

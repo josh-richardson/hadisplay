@@ -18,6 +18,11 @@ enum class ButtonId {
     BrightnessToggle = 0,
     DevModeToggle,
     SetupToggleLight,
+    SetupOpenRoom,
+    SetupShowPatterns,
+    SetupTogglePattern,
+    SetupCycleBrowseMode,
+    SetupCycleTypeFilter,
     SetupPreviousPage,
     SetupNextPage,
     SetupSave,
@@ -50,8 +55,22 @@ struct Button {
 
 enum class ViewMode {
     Setup = 0,
+    SetupPatterns,
     Dashboard,
     Detail,
+};
+
+enum class SetupTypeFilter {
+    All = 0,
+    Lights,
+    Switches,
+    Climate,
+    Sensors,
+};
+
+enum class SetupBrowseMode {
+    List = 0,
+    Rooms,
 };
 
 enum class DisplayMode {
@@ -130,6 +149,7 @@ struct EntityItem {
     double numeric_value = 0.0;
     std::string device_class;
     std::string unit_label;
+    std::string room_label;
     std::string hvac_action;
 };
 
@@ -141,6 +161,9 @@ struct SceneState {
     ViewMode view_mode = ViewMode::Setup;
     std::vector<EntityItem> entities;
     int setup_page = 0;
+    SetupTypeFilter setup_type_filter = SetupTypeFilter::All;
+    SetupBrowseMode setup_browse_mode = SetupBrowseMode::List;
+    std::string setup_room_label;
     int dashboard_page = 0;
     int detail_entity_index = -1;
     std::string time_label = "--:--";
@@ -158,6 +181,7 @@ struct SceneState {
     bool weather_available = false;
     std::string weather_condition = "cloudy";
     std::string weather_range_label = "--/--";
+    std::vector<std::string> hidden_entity_patterns;
     std::string detail_history_entity_id;
     bool detail_history_loading = false;
     bool detail_history_available = false;

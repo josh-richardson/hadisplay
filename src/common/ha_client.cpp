@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
@@ -601,6 +602,51 @@ json::ParseResult parse_http_json(const HttpResult& result) {
     return parsed;
 }
 
+std::map<std::string, std::string> fetch_area_names(const std::string& base_url,
+                                                    const std::string& token,
+                                                    const std::vector<EntityState>& entities) {
+    if (entities.empty()) {
+        return {};
+    }
+
+    json::Value::Array entity_ids;
+    entity_ids.reserve(entities.size());
+    for (const EntityState& entity : entities) {
+        entity_ids.emplace_back(entity.entity_id);
+    }
+
+    const std::string entity_ids_json = json::stringify(json::Value(std::move(entity_ids)));
+    const std::string area_template =
+        "{% set ids = " + entity_ids_json + " %}"
+        "{% for entity_id in ids %}"
+        "{{ entity_id }}\t{{ area_name(entity_id) or '' }}"
+        "{% if not loop.last %}\n{% endif %}"
+        "{% endfor %}";
+    const std::string body = json::stringify(json::Value(json::Value::Object{
+        {"template", json::Value(area_template)},
+    }));
+    const HttpResult result = http_request_json("POST", base_url + "/api/template", token, &body);
+    if (!result.ok) {
+        return {};
+    }
+
+    std::map<std::string, std::string> area_names;
+    std::istringstream lines(result.body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::size_t split = line.find('\t');
+        if (split == std::string::npos) {
+            continue;
+        }
+        const std::string entity_id = trim(line.substr(0, split));
+        if (entity_id.empty()) {
+            continue;
+        }
+        area_names[entity_id] = trim(line.substr(split + 1));
+    }
+    return area_names;
+}
+
 }  // namespace
 
 Client::Client(ClientConfig config) {
@@ -671,6 +717,14 @@ EntityListResult Client::list_entities() const {
         EntityState entity = parse_entity_state(entry);
         if (entity.ok) {
             entities.push_back(std::move(entity));
+        }
+    }
+
+    const std::map<std::string, std::string> area_names = fetch_area_names(base_url_, token_, entities);
+    for (EntityState& entity : entities) {
+        const auto area = area_names.find(entity.entity_id);
+        if (area != area_names.end()) {
+            entity.area_name = area->second;
         }
     }
 
