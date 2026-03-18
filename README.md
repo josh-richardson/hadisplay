@@ -32,6 +32,7 @@ It runs as a standalone app on the Kobo, takes over the screen while active, and
   - current and target temperature
   - heating state
   - heat on/off control
+- Kobo-style sleep/wake on the hardware power button
 - Config persisted to JSON on the device
 
 ## Kobo requirements
@@ -192,7 +193,11 @@ menu_item:main:Hadisplay:cmd_spawn:quiet:exec /bin/sh /mnt/onboard/.adds/hadispl
 - captures the required Nickel environment
 - stops Nickel and helper processes
 - launches `hadisplay`
+- pauses background Wi-Fi keepalive while the device is asleep
 - restarts Nickel when `hadisplay` exits
+
+While `hadisplay` is running, press the Kobo power button to sleep and press it again to wake.
+For normal use, launch via `run-hadisplay.sh`; the sleep feature also expects KOReader to remain installed because `hadisplay` reuses KOReader's Kobo Wi-Fi helper scripts during suspend and resume.
 
 ### Manual SSH launch
 
@@ -202,7 +207,7 @@ cd /mnt/onboard/.adds/hadisplay
 LD_LIBRARY_PATH=/mnt/onboard/.niluje/usbnet/lib ./hadisplay
 ```
 
-Manual launch is useful for debugging, but it does not provide the normal Nickel lifecycle handling. For normal use, prefer the NickelMenu launcher.
+Manual launch is useful for debugging, but it does not provide the normal Nickel lifecycle handling and is not the recommended path for sleep/wake testing. For normal use, prefer the NickelMenu launcher.
 
 ## Device notes
 

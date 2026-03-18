@@ -1,7 +1,6 @@
 build*/
 .deps/
 .env
-archive/
 output/*
 !output/.gitkeep
 .claude

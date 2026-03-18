@@ -91,6 +91,7 @@ wifi_keepalive() {
 }
 wifi_keepalive &
 KEEPALIVE_PID=$!
+export HADISPLAY_KEEPALIVE_PID="${KEEPALIVE_PID}"
 
 # Run hadisplay.
 if [ -n "${ORIG_LD_LIBRARY_PATH}" ]; then
