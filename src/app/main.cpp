@@ -1527,6 +1527,24 @@ bool render_kernel_sleep_hint(int fbfd,
     });
 }
 
+bool render_resume_hint(int fbfd, const DisplaySettings& display_settings) {
+    FBInkConfig cfg{};
+    cfg.is_quiet = true;
+    cfg.is_cleared = true;
+    cfg.is_centered = true;
+    cfg.is_halfway = true;
+    cfg.is_padded = true;
+    cfg.fontmult = 2;
+    cfg.is_flashing = false;
+    if (display_settings.effective_mode == hadisplay::DisplayMode::Color) {
+        cfg.wfm_mode = WFM_GLRC16;
+    }
+
+    return retry_fbink_call("fbink_print", [&]() {
+        return fbink_print(fbfd, "WAKING...\nRestoring connection", &cfg);
+    });
+}
+
 bool save_dirty_config(hadisplay::ConfigStore& config_store,
                        const hadisplay::SceneState& scene_state,
                        const hadisplay::AppConfig& config,
@@ -2301,6 +2319,9 @@ int main() {
 
             if (power_state.state == PowerState::Sleeping) {
                 power_state.state = PowerState::Awake;
+                if (!render_resume_hint(fbfd, display_settings)) {
+                    hadisplay::log_warn("Failed to render resume hint");
+                }
                 resume_runtime_services(power_state, device_status);
                 refresh_input_grabs(input_devices);
                 apply_system_status(scene_state, device_status.snapshot());
@@ -2351,6 +2372,9 @@ int main() {
                         refresh_input_grabs(input_devices);
                         touch = {};
                         power_button_pressed = false;
+                        if (!render_resume_hint(fbfd, display_settings)) {
+                            hadisplay::log_warn("Failed to render resume hint");
+                        }
                         // Any wake from a successful kernel suspend is
                         // legitimate — resume immediately.
                         power_state.state = PowerState::Awake;
