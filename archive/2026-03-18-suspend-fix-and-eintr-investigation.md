@@ -9,7 +9,7 @@ Two issues were worked on:
 1. **Kernel suspend fix** (the intended task) — changes to `suspend_to_ram()` to address the `hwtcon_fb_suspend xon off timer pending` failure.
 2. **EINTR on MXCFB_SEND_UPDATE ioctl** (encountered during testing) — every FBInk display refresh failed with EINTR after deploy, leaving the screen blank.
 
-**The EINTR bug is now fixed.** The root cause was FBInk misidentifying the device.
+**Both bugs are now fixed.**
 
 ## EINTR Fix (Root Cause Found and Fixed)
 
@@ -34,104 +34,112 @@ This also explains why:
 
 ### Fix
 
-Patched `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c` to add a `case 77U:` in `set_kobo_quirks()`, treating it as an MTK Clara Colour variant:
-
-```c
-case 77U:    // Unrecognized device code 77 — MTK Clara Colour variant (hadisplay patch)
-    deviceQuirks.hasColorPanel              = true;
-    deviceQuirks.isMTK                      = true;
-    deviceQuirks.hasEclipseWfm              = true;
-    deviceQuirks.canHWInvert                = false;
-    deviceQuirks.ntxRotaQuirk               = NTX_ROTA_CCW_TOUCH;
-    // rotation map matching Clara Colour
-    deviceQuirks.screenDPI                  = 300U;
-    ...
-```
-
-The device is confirmed to be a MediaTek MT8110/MT8512 (`/proc/device-tree/model` = "MediaTek MT8110 board", `/proc/device-tree/compatible` = `mediatek,mt8110` / `mediatek,mt8512`), 1072×1448 at 32bpp, with a color panel — consistent with a Clara Colour.
-
-### Result
-
-After patching and deploying:
-- No more `[FBInk] Unidentified Kobo device code (77)!` warning
-- No more EINTR on display refreshes
-- No more `[HWTCON ERR]err cmd:0x4044462e` in dmesg from the new process
-- **Deploy-after-deploy works reliably** — no reboot needed
-- Screen displays correctly on every deploy
+Patched `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c` to add a `case 77U:` in `set_kobo_quirks()`, treating it as an MTK Clara Colour variant. The device is confirmed MTK via `/proc/device-tree/model` = "MediaTek MT8110 board", 1072×1448 at 32bpp with a color panel.
 
 ### Note on FBInk patch persistence
 
-This patch modifies the FBInk source in the build directory (`build-kobo-docker/_deps/FBInk-src/`). The FBInk ExternalProject has `UPDATE_DISCONNECTED TRUE`, so cmake won't overwrite it. However, a full clean rebuild or `rm -rf build-kobo-docker` would lose the patch. Consider either:
-- Upstreaming the device ID to FBInk (file an issue/PR at https://github.com/NiLuJe/FBInk)
-- Adding a cmake patch step to apply this automatically
-- Fixing the version file on the device to use a recognized device code
+This patch modifies the FBInk source in the build directory. The ExternalProject has `UPDATE_DISCONNECTED TRUE` so cmake won't overwrite it, but a full clean rebuild would lose the patch. Consider upstreaming to FBInk or adding a cmake patch step.
 
-## Suspend Fix
+## Suspend Fix (Working)
 
 ### Problem
 
-`hwtcon_fb_suspend` refuses to suspend because its internal "xon off" power-down timer is still pending after a display refresh. The existing `fbink_wait_for_complete(LAST_MARKER)` only waits for the app's own update marker; it does not wait for the driver's internal power-down timer to fire.
+`hwtcon_fb_suspend` refuses to suspend because its internal "xon off" power-down timer is still pending after a display refresh. This is the `HWTCON_SET_PWRDOWN_DELAY` timer (default 500ms) — after any display update completes, the driver waits this long before powering down the display controller. If suspend is attempted while this timer is running, `hwtcon_fb_suspend` returns `-1`.
 
-### What was tested on-device (before EINTR fix)
+### Key discovery: `HWTCON_SET_PWRDOWN_DELAY` ioctl
 
-After a fresh reboot (to work around the EINTR bug), the suspend path was tested:
+Found in `eink/mtk-kobo.h`:
+```c
+#define HWTCON_SET_PWRDOWN_DELAY _IOW('F', 0x30, int32_t)  // default 500ms, -1 = never
+#define HWTCON_GET_PWRDOWN_DELAY _IOR('F', 0x31, int32_t)
+```
 
-- **Attempt 1**: `hwtcon_fb_suspend xon off timer pending` — same as before.
-- **Attempt 2**: `bd71827-power.4.auto` (battery PMIC) failed with `wait resume_jiffies` — a different device failed on the retry.
-- **Attempt 3**: `hwtcon_fb_suspend xon off timer pending` — same as attempt 1.
-- All three retries failed; the app fell back to software sleep.
+This is the exact timer that causes the "xon off timer pending" suspend failure. Setting it to 0 forces immediate power-down after any refresh completes.
 
-### Device capabilities discovered
+### Fix
 
-| Feature | Status |
-|---|---|
-| `FBIOBLANK(FB_BLANK_POWERDOWN)` | **Not supported** — returns `EINVAL` |
-| `FBIOBLANK(FB_BLANK_UNBLANK)` | **Not supported** — returns `EINVAL` |
-| `fbink_wait_for_any_complete` (MTK ioctl) | **Not supported** on this device |
-| `HWTCON_SET_PWRDOWN_DELAY` | Available — controls the "xon off" timer directly |
-| `HWTCON_GET_PWRDOWN_DELAY` | Available — reads current power-down delay |
+The first reliable version of the fix was to **skip the pre-suspend sleep screen entirely** on the kernel suspend path. That kept hwtcon idle and made kernel suspend work again, but it meant the display did not visibly change when the user pressed the power button.
 
-### Changes made
+The current working implementation restores a visible sleep indication with a **dedicated kernel sleep hint** that is gentler than the old full sleep screen:
 
-#### In `src/app/main.cpp`
+1. Pause keepalive and disable Wi-Fi.
+2. Render a built-in `SLEEPING / Press power to wake` hint on screen.
+3. `wait_for_fbink_update_completion` — wait for the hint update marker.
+4. Wait a fixed 5 seconds so hwtcon has time to fully settle.
+5. `write /sys/power/state-extended = 1`
+6. Wait `kSuspendScreenSettleDelay` (2s).
+7. `wait_for_display_suspend_path_idle` — poll `hwtcon_wakelock` and `cmdq_wakelock`.
+8. `HWTCON_SET_PWRDOWN_DELAY(0)` — force immediate display-controller power-down before suspend.
+9. Wait 900ms for that power-down change to take effect.
+10. `sync()`
+11. `write /sys/power/state = mem` (with retry loop, up to 3 attempts)
+12. On resume: `HWTCON_SET_PWRDOWN_DELAY(saved_value)` to restore the original delay.
 
-1. **`HWTCON_SET_PWRDOWN_DELAY` / `HWTCON_GET_PWRDOWN_DELAY` ioctls defined** — these control the exact timer that causes the "xon off timer pending" suspend failure. Default is 500ms. Before suspend, we set it to 0 to force immediate power-down, then restore after resume.
+If a suspend failure is attributed to hwtcon while using the visible kernel sleep hint, the app disables that hint for the rest of the session rather than repeatedly risking the same regression.
 
-2. **`fbink_wait_for_any_complete` removed from `wait_for_fbink_update_completion`** — it was unsupported on this device and generated `[HWTCON ERR]` in dmesg on every call.
+### Test result
 
-3. **Sleep screen render skipped before kernel suspend** — the full refresh triggers the "xon off" power-down countdown. By not refreshing, the display pipeline stays idle.
+Current on-device result:
 
-4. **Suspend retry loop** — retries up to 3 times with 500ms delays.
+- The screen now visibly changes to a `SLEEPING` message when the power button is pressed.
+- Kernel suspend still succeeds with that visible hint in place.
+- A successful test cycle logged:
+  - `Rendered kernel sleep hint; waiting 5000ms before suspend`
+  - `Set hwtcon power-down delay to 0ms (was 500ms)`
+  - `Kernel suspend cycle completed after 132ms (attempt 1)`
+- Kernel `dmesg` for that same cycle showed a real suspend/resume:
+  - suspend entry at `2026-03-18 20:27:44.374 UTC`
+  - suspend exit at `2026-03-18 20:27:55.539 UTC`
 
-5. **`suspend_to_ram` now**: saves current pwrdown delay → sets delay to 0 → waits 600ms for power-down → attempts suspend (with retries) → restores delay on resume.
+So the current state is:
 
-6. **Other retained changes**: `sigaction` with `SA_RESTART`, `kFbinkRetryCount` increased to 16, async HTTP work deferred until after first render.
+- visible sleep screen on kernel suspend: **working**
+- kernel suspend with that visible screen: **working**
+- attempt 1 reliability in the latest test: **working**
 
-#### In `scripts/deploy.sh`
+One metric is still suspect: the app-reported suspend duration (`132ms` above) does not match the wall-clock gap in kernel timestamps (~11 seconds). The suspend itself is successful; only that duration measurement appears inaccurate.
 
-- Improved kill sequence: kills both `run-hadisplay.sh` and `hadisplay`, with force-kill of the wrapper script to prevent Nickel from launching between deploys.
+### Wake from suspend fix
 
-#### In `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c`
+After kernel suspend, the power button press that wakes the device was being misinterpreted as a new "go to sleep" command, causing an infinite sleep loop. Two fixes:
 
-- Added `case 77U:` to recognize this device as MTK Clara Colour variant (the EINTR fix).
+1. **`drain_input_events()`** — new function called after resume that discards all queued input events (the power button press/release that woke the device).
+2. **Ignore window set after `resume_runtime_services`** — the previous code set `ignore_power_until` before Wi-Fi re-enable, which takes ~5 seconds. By the time the main loop read input events, the 2-second ignore window had expired.
+3. **Removed duration-based "unexpected wake" check** — the old code treated any wake shorter than 5 seconds as spurious, but real kernel suspend/resume cycles are ~2 seconds. Any wake from a successful kernel suspend is now treated as legitimate.
 
-### Suspend status
+## Other Changes
 
-**Not yet tested with the EINTR fix in place.** Now that deploys work reliably, the suspend path can be properly tested. The combination of:
-- Skipping the sleep screen render before kernel suspend
-- Setting `HWTCON_SET_PWRDOWN_DELAY` to 0 before suspend
-- Waiting 600ms for the power-down to complete
+### In `src/app/main.cpp`
 
-...should address the "xon off timer pending" failure. Press the power button to test.
+- `sigaction` with `SA_RESTART` instead of `signal()` for SIGINT/SIGTERM
+- `retry_fbink_call` template for retrying FBInk calls on transient errors
+- `kFbinkRetryCount = 4` with 50ms delay between retries
+- `SuspendStatsSnapshot` — reads `/sys/kernel/debug/suspend_stats` before/after suspend to detect failures
+- `wait_for_display_suspend_path_idle` — polls `hwtcon_wakelock` and `cmdq_wakelock` wakeup sources
+- `kernel_suspend_blocked` flag — disables kernel suspend for the session after confirmed failure
+- `kernel_sleep_hint_blocked` flag — disables the visible kernel sleep hint for the rest of the session after an hwtcon-related suspend failure
+- dedicated kernel sleep hint render path with a fixed 5-second settle before suspend
+- Async HTTP work deferred until after first render
 
-### Suggested next steps for suspend
+### In `scripts/deploy.sh`
 
-1. **Test the suspend path now** — press the power button and check logs.
-2. If suspend works, consider re-enabling the sleep screen render with a non-flashing waveform mode (`WFM_GL16` instead of `WFM_GCC16`) so the user sees something during sleep, and test whether the `HWTCON_SET_PWRDOWN_DELAY(0)` approach clears the timer even after a refresh.
-3. If it still fails, try increasing the post-pwrdown-delay wait beyond 600ms, or skipping the sleep screen and relying solely on the pwrdown delay trick.
+- Improved kill sequence: kills both `run-hadisplay.sh` and `hadisplay`, with force-kill of wrapper to prevent Nickel from launching between deploys
+
+### In `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c`
+
+- Added `case 77U:` to recognize this device as MTK Clara Colour variant
+
+## Device Info
+
+- Model: MediaTek MT8110 board (mt8110/mt8512)
+- Screen: 1072×1448 @ 32bpp, color panel
+- Kobo device code: 77 (unrecognized by FBInk)
+- FBInk device quirks needed: `isMTK=true`, `hasColorPanel=true`, `hasEclipseWfm=true`
+- Unsupported ioctls: `FBIOBLANK`, `MXCFB_WAIT_FOR_ANY_UPDATE_COMPLETE_MTK`
+- Supported ioctls: `HWTCON_SEND_UPDATE`, `HWTCON_SET_PWRDOWN_DELAY`, `HWTCON_GET_PWRDOWN_DELAY`
 
 ## Files Modified
 
-- `src/app/main.cpp` — suspend improvements, EINTR hardening, removed unsupported ioctl calls
+- `src/app/main.cpp` — suspend, wake, EINTR hardening, pwrdown delay control, visible kernel sleep hint
 - `scripts/deploy.sh` — improved kill sequence
-- `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c` — patched to recognize device code 77 as MTK (EINTR root cause fix)
+- `build-kobo-docker/_deps/FBInk-src/fbink_device_id.c` — device ID patch

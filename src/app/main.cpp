@@ -66,10 +66,10 @@ constexpr auto kDisplayIdlePollInterval = std::chrono::milliseconds(100);
 constexpr auto kDisplayIdleTimeout = std::chrono::seconds(12);
 constexpr int kFbinkRetryCount = 4;
 constexpr auto kFbinkRetryDelay = std::chrono::milliseconds(50);
-constexpr auto kUnexpectedWakeThreshold = std::chrono::seconds(5);
 constexpr auto kPostResumePowerIgnoreWindow = std::chrono::seconds(2);
 constexpr int kSuspendRetryCount = 3;
-constexpr auto kSuspendRetryDelay = std::chrono::milliseconds(500);
+constexpr auto kSuspendRetryDelay = std::chrono::milliseconds(1500);
+constexpr auto kKernelSleepHintSettleDelay = std::chrono::seconds(5);
 
 volatile sig_atomic_t g_running = 1;
 
@@ -101,6 +101,7 @@ struct PowerStateContext {
     bool keepalive_paused = false;
     bool wifi_disabled_for_sleep = false;
     bool kernel_suspend_blocked = false;
+    bool kernel_sleep_hint_blocked = false;
     std::string kernel_suspend_block_reason;
     std::chrono::steady_clock::time_point ignore_power_until{};
 };
@@ -1500,6 +1501,32 @@ bool render_sleep_screen(int fbfd,
     return true;
 }
 
+bool render_kernel_sleep_hint(int fbfd,
+                              const DisplaySettings& display_settings,
+                              std::string_view detail_line) {
+    FBInkConfig cfg{};
+    cfg.is_quiet = true;
+    cfg.is_cleared = true;
+    cfg.is_centered = true;
+    cfg.is_halfway = true;
+    cfg.is_padded = true;
+    cfg.fontmult = 2;
+    cfg.is_flashing = false;
+    if (display_settings.effective_mode == hadisplay::DisplayMode::Color) {
+        cfg.wfm_mode = WFM_GLRC16;
+    }
+
+    std::string message = "SLEEPING\nPress power to wake";
+    if (!detail_line.empty()) {
+        message += "\n\n";
+        message += detail_line;
+    }
+
+    return retry_fbink_call("fbink_print", [&]() {
+        return fbink_print(fbfd, message.c_str(), &cfg);
+    });
+}
+
 bool save_dirty_config(hadisplay::ConfigStore& config_store,
                        const hadisplay::SceneState& scene_state,
                        const hadisplay::AppConfig& config,
@@ -1597,28 +1624,19 @@ SuspendResult suspend_to_ram(int fbfd) {
         };
     }
 
-    // Clear the hwtcon power-down delay timer. The "xon off timer pending"
-    // suspend failure is caused by this timer still running after a display
-    // update. Setting it to 0 forces immediate power-down, clearing the
-    // timer before we attempt suspend.
     int32_t saved_pwrdown_delay = -1;
     if (ioctl(fbfd, HWTCON_GET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
         hadisplay::log_warn("HWTCON_GET_PWRDOWN_DELAY failed: " + std::string(strerror(errno)));
-        saved_pwrdown_delay = 500; // default per driver docs
-    } else {
-        hadisplay::log_info("hwtcon power-down delay was " + std::to_string(saved_pwrdown_delay) + "ms");
+        saved_pwrdown_delay = 500;
     }
     int32_t zero_delay = 0;
     if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &zero_delay) < 0) {
         hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY(0) failed: " + std::string(strerror(errno)));
-    } else {
-        hadisplay::log_info("Set hwtcon power-down delay to 0ms for suspend");
-        // Wait for the power-down to actually happen now that the delay is 0.
-        // The old timer (default 500ms) may have already been counting down,
-        // but with delay=0 the controller should power down immediately once
-        // any in-flight update completes.
-        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    } else if (saved_pwrdown_delay != 0) {
+        hadisplay::log_info("Set hwtcon power-down delay to 0ms (was " +
+                            std::to_string(saved_pwrdown_delay) + "ms)");
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
 
     ::sync();
 
@@ -1675,7 +1693,6 @@ SuspendResult suspend_to_ram(int fbfd) {
         hadisplay::log_warn("Failed to write /sys/power/state-extended=0 after resume");
     }
 
-    // Restore the original power-down delay after resume.
     if (saved_pwrdown_delay >= 0) {
         if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
             hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY restore failed: " + std::string(strerror(errno)));
@@ -1692,6 +1709,17 @@ void refresh_input_grabs(InputDevices& devices) {
     for (auto& device : devices.devices) {
         if (device.fd >= 0) {
             grab_input_device(device);
+        }
+    }
+}
+
+void drain_input_events(InputDevices& devices) {
+    struct input_event ev{};
+    for (auto& device : devices.devices) {
+        if (device.fd >= 0) {
+            while (read(device.fd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+                // discard
+            }
         }
     }
 }
@@ -2293,53 +2321,69 @@ int main() {
 
                 pause_runtime_services(power_state);
                 const bool will_kernel_suspend = kernel_suspend_supported(power_state, sleep_status);
+                const bool show_kernel_sleep_hint =
+                    will_kernel_suspend && !power_state.kernel_sleep_hint_blocked;
 
-                // Render the sleep screen AFTER pausing services but only if
-                // we won't attempt kernel suspend. The full refresh leaves the
-                // hwtcon display controller with a pending "xon off" timer that
-                // blocks suspend. For kernel suspend, we skip the sleep screen
-                // so the display pipeline is idle when we write to /sys/power/state.
-                if (!will_kernel_suspend) {
-                    const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
-                    if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
-                        resume_runtime_services(power_state, device_status);
-                        break;
-                    }
+                const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
+                if (!will_kernel_suspend && !render_sleep_screen(fbfd, display_settings, sleep_detail)) {
+                    resume_runtime_services(power_state, device_status);
+                    break;
                 }
 
                 if (will_kernel_suspend) {
+                    if (show_kernel_sleep_hint) {
+                        if (render_kernel_sleep_hint(fbfd, display_settings, sleep_detail)) {
+                            hadisplay::log_info("Rendered kernel sleep hint; waiting " +
+                                                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                                   kKernelSleepHintSettleDelay)
+                                                                   .count()) +
+                                                "ms before suspend");
+                            (void)wait_for_fbink_update_completion(fbfd, "kernel sleep hint");
+                            std::this_thread::sleep_for(kKernelSleepHintSettleDelay);
+                        } else {
+                            hadisplay::log_warn("Kernel sleep hint render failed; continuing without it");
+                        }
+                    } else {
+                        hadisplay::log_info("Skipping kernel sleep hint after earlier hwtcon suspend failure");
+                    }
                     const SuspendResult suspend_result = suspend_to_ram(fbfd);
                     if (suspend_result.ok) {
                         refresh_input_grabs(input_devices);
                         touch = {};
                         power_button_pressed = false;
+                        // Any wake from a successful kernel suspend is
+                        // legitimate — resume immediately.
+                        power_state.state = PowerState::Awake;
+                        resume_runtime_services(power_state, device_status);
+                        // Drain any queued input events (the power button
+                        // press that woke the device from suspend) and set
+                        // an ignore window as a safety net.
+                        drain_input_events(input_devices);
                         power_state.ignore_power_until = std::chrono::steady_clock::now() + kPostResumePowerIgnoreWindow;
-                        if (suspend_result.sleep_duration < kUnexpectedWakeThreshold) {
-                            power_state.state = PowerState::Sleeping;
-                            scene_state.status = "SLEEPING";
-                            needs_redraw = false;
-                            force_full_refresh = false;
-                            hadisplay::log_warn("Unexpected wake detected; staying asleep");
-                        } else {
-                            power_state.state = PowerState::Awake;
-                            resume_runtime_services(power_state, device_status);
-                            apply_system_status(scene_state, device_status.snapshot());
-                            update_clock_status(scene_state);
-                            scene_state.status = "AWAKE";
-                            force_full_refresh = true;
-                            needs_redraw = true;
-                            now = std::chrono::steady_clock::now();
-                            next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
-                            next_light_refresh = now + std::chrono::seconds(5);
-                            next_device_refresh = now + std::chrono::seconds(2);
-                            next_weather_refresh = now + std::chrono::seconds(5);
-                        }
+                        apply_system_status(scene_state, device_status.snapshot());
+                        update_clock_status(scene_state);
+                        scene_state.status = "AWAKE";
+                        force_full_refresh = true;
+                        needs_redraw = true;
+                        now = std::chrono::steady_clock::now();
+                        next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
+                        next_light_refresh = now + std::chrono::seconds(5);
+                        next_device_refresh = now + std::chrono::seconds(2);
+                        next_weather_refresh = now + std::chrono::seconds(5);
                     } else {
+                        if (show_kernel_sleep_hint &&
+                            suspend_result.failure_reason.find("hwtcon") != std::string::npos) {
+                            power_state.kernel_sleep_hint_blocked = true;
+                            hadisplay::log_warn("Disabling kernel sleep hint for this session after hwtcon suspend failure");
+                        }
                         if (!suspend_result.failure_reason.empty()) {
                             power_state.kernel_suspend_blocked = true;
                             power_state.kernel_suspend_block_reason = suspend_result.failure_reason;
                             hadisplay::log_warn("Blocking further kernel suspend attempts: " +
                                                 power_state.kernel_suspend_block_reason);
+                        }
+                        if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
+                            hadisplay::log_warn("Failed to render sleep screen for software fallback");
                         }
                         power_state.state = PowerState::Sleeping;
                         scene_state.status = "SLEEPING";
