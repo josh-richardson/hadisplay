@@ -10,6 +10,12 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 
+// MTK hwtcon ioctls for display power-down delay control.
+// The "xon off timer" that blocks suspend is this power-down delay timer.
+#define HWTCON_IOCTL_MAGIC_NUMBER 'F'
+#define HWTCON_SET_PWRDOWN_DELAY _IOW(HWTCON_IOCTL_MAGIC_NUMBER, 0x30, int32_t)
+#define HWTCON_GET_PWRDOWN_DELAY _IOR(HWTCON_IOCTL_MAGIC_NUMBER, 0x31, int32_t)
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -44,6 +50,8 @@ constexpr const char* kKoreaderDir = "/mnt/onboard/.adds/koreader";
 constexpr const char* kKoreaderDisableWifiScript = "/mnt/onboard/.adds/koreader/disable-wifi.sh";
 constexpr const char* kKoreaderEnableWifiScript = "/mnt/onboard/.adds/koreader/enable-wifi.sh";
 constexpr const char* kKoreaderObtainIpScript = "/mnt/onboard/.adds/koreader/obtain-ip.sh";
+constexpr const char* kSuspendStatsPath = "/sys/kernel/debug/suspend_stats";
+constexpr const char* kWakeupSourcesPath = "/sys/kernel/debug/wakeup_sources";
 constexpr int kTouchMaxX = 1447;
 constexpr int kTouchMaxY = 1071;
 constexpr int kMaxPartialRefreshes = 12;
@@ -54,8 +62,14 @@ constexpr auto kNormalWeatherPollInterval = std::chrono::hours(1);
 constexpr auto kDevPollInterval = std::chrono::seconds(10);
 constexpr auto kSuspendScreenSettleDelay = std::chrono::seconds(2);
 constexpr auto kResumeSettleDelay = std::chrono::milliseconds(100);
+constexpr auto kDisplayIdlePollInterval = std::chrono::milliseconds(100);
+constexpr auto kDisplayIdleTimeout = std::chrono::seconds(12);
+constexpr int kFbinkRetryCount = 4;
+constexpr auto kFbinkRetryDelay = std::chrono::milliseconds(50);
 constexpr auto kUnexpectedWakeThreshold = std::chrono::seconds(5);
 constexpr auto kPostResumePowerIgnoreWindow = std::chrono::seconds(2);
+constexpr int kSuspendRetryCount = 3;
+constexpr auto kSuspendRetryDelay = std::chrono::milliseconds(500);
 
 volatile sig_atomic_t g_running = 1;
 
@@ -86,6 +100,8 @@ struct PowerStateContext {
     PowerState state = PowerState::Awake;
     bool keepalive_paused = false;
     bool wifi_disabled_for_sleep = false;
+    bool kernel_suspend_blocked = false;
+    std::string kernel_suspend_block_reason;
     std::chrono::steady_clock::time_point ignore_power_until{};
 };
 
@@ -217,6 +233,172 @@ bool write_trimmed_file(const std::filesystem::path& path, const std::string& va
 
     output << value;
     return output.good();
+}
+
+struct SuspendStatsSnapshot {
+    bool available = false;
+    std::uint64_t success = 0;
+    std::uint64_t fail = 0;
+    std::string last_failed_dev;
+    std::string last_failed_step;
+    int last_failed_errno = 0;
+};
+
+SuspendStatsSnapshot read_suspend_stats_snapshot() {
+    std::ifstream input(kSuspendStatsPath);
+    if (!input) {
+        return {};
+    }
+
+    SuspendStatsSnapshot snapshot;
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trim(line.substr(0, colon));
+        const std::string value = trim(line.substr(colon + 1));
+        if (key == "success") {
+            snapshot.success = static_cast<std::uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+            snapshot.available = true;
+        } else if (key == "fail") {
+            snapshot.fail = static_cast<std::uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+            snapshot.available = true;
+        } else if (key == "last_failed_dev") {
+            snapshot.last_failed_dev = value;
+            snapshot.available = true;
+        } else if (key == "last_failed_errno") {
+            snapshot.last_failed_errno = std::atoi(value.c_str());
+            snapshot.available = true;
+        } else if (key == "last_failed_step") {
+            snapshot.last_failed_step = value;
+            snapshot.available = true;
+        }
+    }
+    return snapshot;
+}
+
+std::string describe_suspend_failure(const SuspendStatsSnapshot& before,
+                                     const SuspendStatsSnapshot& after) {
+    if (after.fail > before.fail) {
+        std::ostringstream reason;
+        reason << "kernel suspend failed";
+        if (!after.last_failed_dev.empty()) {
+            reason << " at " << after.last_failed_dev;
+        }
+        if (!after.last_failed_step.empty()) {
+            reason << " during " << after.last_failed_step;
+        }
+        if (after.last_failed_errno != 0) {
+            reason << " (errno " << after.last_failed_errno << ")";
+        }
+        return reason.str();
+    }
+
+    if (after.success == before.success) {
+        return "kernel suspend did not report a successful suspend cycle";
+    }
+    return {};
+}
+
+struct WakeupSourceState {
+    bool seen = false;
+    unsigned long long active_since = 0;
+};
+
+WakeupSourceState read_named_wakeup_source(std::string_view source_name) {
+    std::ifstream input(kWakeupSourcesPath);
+    if (!input) {
+        return {};
+    }
+
+    std::string line;
+    std::getline(input, line);  // Header.
+    while (std::getline(input, line)) {
+        if (!line.starts_with(source_name)) {
+            continue;
+        }
+
+        std::istringstream fields(line);
+        std::string name;
+        unsigned long long active_count = 0;
+        unsigned long long event_count = 0;
+        unsigned long long wakeup_count = 0;
+        unsigned long long expire_count = 0;
+        unsigned long long active_since = 0;
+        if (fields >> name >> active_count >> event_count >> wakeup_count >> expire_count >> active_since) {
+            return {
+                .seen = true,
+                .active_since = active_since,
+            };
+        }
+        return {};
+    }
+
+    return {};
+}
+
+bool display_suspend_path_idle(std::string* busy_reason = nullptr) {
+    const WakeupSourceState hwtcon = read_named_wakeup_source("hwtcon_wakelock");
+    const WakeupSourceState cmdq = read_named_wakeup_source("cmdq_wakelock");
+    if (!hwtcon.seen && !cmdq.seen) {
+        return true;
+    }
+
+    std::vector<std::string> busy_sources;
+    if (hwtcon.seen && hwtcon.active_since != 0) {
+        busy_sources.push_back("hwtcon_wakelock");
+    }
+    if (cmdq.seen && cmdq.active_since != 0) {
+        busy_sources.push_back("cmdq_wakelock");
+    }
+    if (busy_reason != nullptr) {
+        if (busy_sources.empty()) {
+            *busy_reason = {};
+        } else {
+            std::ostringstream reason;
+            reason << "display pipeline still busy";
+            for (std::size_t i = 0; i < busy_sources.size(); ++i) {
+                reason << (i == 0 ? " (" : ", ") << busy_sources[i];
+            }
+            reason << ")";
+            *busy_reason = reason.str();
+        }
+    }
+    return busy_sources.empty();
+}
+
+bool wait_for_display_suspend_path_idle(std::chrono::steady_clock::duration timeout,
+                                        std::string* failure_reason = nullptr) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int consecutive_idle_reads = 0;
+    std::string last_busy_reason;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::string busy_reason;
+        if (display_suspend_path_idle(&busy_reason)) {
+            ++consecutive_idle_reads;
+            if (consecutive_idle_reads >= 2) {
+                return true;
+            }
+        } else {
+            consecutive_idle_reads = 0;
+            last_busy_reason = busy_reason;
+        }
+        std::this_thread::sleep_for(kDisplayIdlePollInterval);
+    }
+
+    if (failure_reason != nullptr) {
+        std::ostringstream reason;
+        reason << "timed out waiting for display pipeline to go idle";
+        if (!last_busy_reason.empty()) {
+            reason << ": " << last_busy_reason;
+        }
+        *failure_reason = reason.str();
+    }
+    return false;
 }
 
 std::optional<pid_t> keepalive_pid_from_env() {
@@ -1207,6 +1389,36 @@ DisplaySettings resolve_display_settings(const FBInkState& fb_state, hadisplay::
     };
 }
 
+template <typename Fn>
+bool retry_fbink_call(const char* operation_name, Fn&& fn) {
+    for (int attempt = 0; attempt < kFbinkRetryCount; ++attempt) {
+        errno = 0;
+        if (fn() >= 0) {
+            return true;
+        }
+
+        if (errno != EINTR || attempt + 1 >= kFbinkRetryCount) {
+            std::cerr << operation_name << " failed.\n";
+            return false;
+        }
+
+        std::this_thread::sleep_for(kFbinkRetryDelay);
+    }
+
+    std::cerr << operation_name << " failed.\n";
+    return false;
+}
+
+bool wait_for_fbink_update_completion(int fbfd, std::string_view context) {
+    const int rc = fbink_wait_for_complete(fbfd, LAST_MARKER);
+    if (rc != 0 && rc != -ENOSYS && rc != -EINVAL) {
+        hadisplay::log_warn("FBInk wait for marker completion failed during " + std::string(context) +
+                            ": rc=" + std::to_string(rc));
+        return false;
+    }
+    return true;
+}
+
 bool render(int fbfd,
             const hadisplay::SceneState& state,
             const std::vector<hadisplay::Button>& buttons,
@@ -1224,15 +1436,16 @@ bool render(int fbfd,
         cfg.is_flashing = should_do_full_refresh(render_state, force_full_refresh);
     }
 
-    if (fbink_print_raw_data(fbfd,
-                             const_cast<unsigned char*>(buffer.pixels.data()),
-                             state.width,
-                             state.height,
-                             buffer.pixels.size(),
-                             0,
-                             0,
-                             &cfg) < 0) {
-        std::cerr << "fbink_print_raw_data failed.\n";
+    if (!retry_fbink_call("fbink_print_raw_data", [&]() {
+            return fbink_print_raw_data(fbfd,
+                                        const_cast<unsigned char*>(buffer.pixels.data()),
+                                        state.width,
+                                        state.height,
+                                        buffer.pixels.size(),
+                                        0,
+                                        0,
+                                        &cfg);
+        })) {
         return false;
     }
 
@@ -1253,7 +1466,9 @@ void clear_screen(int fbfd, bool full_refresh, const DisplaySettings& display_se
     if (display_settings.effective_mode == hadisplay::DisplayMode::Color) {
         cfg.wfm_mode = WFM_GCC16;
     }
-    fbink_cls(fbfd, &cfg, nullptr, false);
+    (void)retry_fbink_call("fbink_cls", [&]() {
+        return fbink_cls(fbfd, &cfg, nullptr, false);
+    });
 }
 
 bool render_sleep_screen(int fbfd,
@@ -1277,8 +1492,9 @@ bool render_sleep_screen(int fbfd,
         message += detail_line;
     }
 
-    if (fbink_print(fbfd, message.c_str(), &cfg) < 0) {
-        std::cerr << "fbink_print failed.\n";
+    if (!retry_fbink_call("fbink_print", [&]() {
+            return fbink_print(fbfd, message.c_str(), &cfg);
+        })) {
         return false;
     }
     return true;
@@ -1325,9 +1541,14 @@ void resume_runtime_services(PowerStateContext& power_state, hadisplay::DeviceSt
     (void)device_status;
 }
 
-bool kernel_suspend_supported(const hadisplay::SystemStatus& system_status) {
+bool kernel_suspend_supported(const PowerStateContext& power_state,
+                              const hadisplay::SystemStatus& system_status) {
     if (system_status.battery_charging) {
         hadisplay::log_info("Kernel suspend skipped while charging");
+        return false;
+    }
+    if (power_state.kernel_suspend_blocked) {
+        hadisplay::log_warn("Kernel suspend disabled for this session: " + power_state.kernel_suspend_block_reason);
         return false;
     }
     if (!file_exists("/sys/power/state") || !file_exists("/sys/power/state-extended")) {
@@ -1346,37 +1567,125 @@ bool kernel_suspend_supported(const hadisplay::SystemStatus& system_status) {
 struct SuspendResult {
     bool ok = false;
     std::chrono::steady_clock::duration sleep_duration{};
+    std::string failure_reason;
 };
 
-SuspendResult suspend_to_ram() {
+SuspendResult suspend_to_ram(int fbfd) {
+    if (!wait_for_fbink_update_completion(fbfd, "pre-suspend")) {
+        return {
+            .ok = false,
+            .sleep_duration = {},
+            .failure_reason = "fbink update completion wait failed before suspend",
+        };
+    }
+
     if (!write_trimmed_file("/sys/power/state-extended", "1")) {
         hadisplay::log_warn("Failed to write /sys/power/state-extended=1");
         return {};
     }
 
     std::this_thread::sleep_for(kSuspendScreenSettleDelay);
-    ::sync();
-    const auto suspend_started_at = std::chrono::steady_clock::now();
-
-    if (!write_trimmed_file("/sys/power/state", "mem")) {
-        hadisplay::log_warn("Failed to write /sys/power/state=mem");
+    (void)wait_for_fbink_update_completion(fbfd, "state-extended suspend settle");
+    std::string display_idle_failure;
+    if (!wait_for_display_suspend_path_idle(kDisplayIdleTimeout, &display_idle_failure)) {
+        hadisplay::log_warn("Kernel suspend skipped: " + display_idle_failure);
         write_trimmed_file("/sys/power/state-extended", "0");
-        return {};
+        return {
+            .ok = false,
+            .sleep_duration = {},
+            .failure_reason = display_idle_failure,
+        };
     }
-    const auto resumed_at = std::chrono::steady_clock::now();
+
+    // Clear the hwtcon power-down delay timer. The "xon off timer pending"
+    // suspend failure is caused by this timer still running after a display
+    // update. Setting it to 0 forces immediate power-down, clearing the
+    // timer before we attempt suspend.
+    int32_t saved_pwrdown_delay = -1;
+    if (ioctl(fbfd, HWTCON_GET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
+        hadisplay::log_warn("HWTCON_GET_PWRDOWN_DELAY failed: " + std::string(strerror(errno)));
+        saved_pwrdown_delay = 500; // default per driver docs
+    } else {
+        hadisplay::log_info("hwtcon power-down delay was " + std::to_string(saved_pwrdown_delay) + "ms");
+    }
+    int32_t zero_delay = 0;
+    if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &zero_delay) < 0) {
+        hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY(0) failed: " + std::string(strerror(errno)));
+    } else {
+        hadisplay::log_info("Set hwtcon power-down delay to 0ms for suspend");
+        // Wait for the power-down to actually happen now that the delay is 0.
+        // The old timer (default 500ms) may have already been counting down,
+        // but with delay=0 the controller should power down immediately once
+        // any in-flight update completes.
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    }
+
+    ::sync();
+
+    // Retry suspend up to kSuspendRetryCount times.
+    SuspendResult result;
+    for (int attempt = 0; attempt < kSuspendRetryCount; ++attempt) {
+        const SuspendStatsSnapshot stats_before = read_suspend_stats_snapshot();
+        const auto suspend_started_at = std::chrono::steady_clock::now();
+
+        if (!write_trimmed_file("/sys/power/state", "mem")) {
+            hadisplay::log_warn("Failed to write /sys/power/state=mem");
+            write_trimmed_file("/sys/power/state-extended", "0");
+            return {};
+        }
+        const auto resumed_at = std::chrono::steady_clock::now();
+        const auto sleep_duration = resumed_at - suspend_started_at;
+        const SuspendStatsSnapshot stats_after = read_suspend_stats_snapshot();
+
+        if (stats_before.available && stats_after.available) {
+            const std::string failure_reason = describe_suspend_failure(stats_before, stats_after);
+            if (!failure_reason.empty()) {
+                hadisplay::log_warn("Kernel suspend rejected (attempt " +
+                                    std::to_string(attempt + 1) + "/" +
+                                    std::to_string(kSuspendRetryCount) + "): " + failure_reason);
+                if (attempt + 1 < kSuspendRetryCount) {
+                    // Wait and let the display controller finish powering down
+                    std::this_thread::sleep_for(kSuspendRetryDelay);
+                    (void)wait_for_fbink_update_completion(fbfd, "suspend retry");
+                    continue;
+                }
+                // Final attempt failed
+                result = {
+                    .ok = false,
+                    .sleep_duration = sleep_duration,
+                    .failure_reason = failure_reason,
+                };
+                break;
+            }
+        }
+
+        // Suspend succeeded
+        hadisplay::log_info("Kernel suspend cycle completed after " +
+                            std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(sleep_duration).count()) +
+                            "ms (attempt " + std::to_string(attempt + 1) + ")");
+        result = {
+            .ok = true,
+            .sleep_duration = sleep_duration,
+            .failure_reason = {},
+        };
+        break;
+    }
 
     if (!write_trimmed_file("/sys/power/state-extended", "0")) {
         hadisplay::log_warn("Failed to write /sys/power/state-extended=0 after resume");
     }
+
+    // Restore the original power-down delay after resume.
+    if (saved_pwrdown_delay >= 0) {
+        if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
+            hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY restore failed: " + std::string(strerror(errno)));
+        } else {
+            hadisplay::log_info("Restored hwtcon power-down delay to " + std::to_string(saved_pwrdown_delay) + "ms");
+        }
+    }
+
     std::this_thread::sleep_for(kResumeSettleDelay);
-    const auto sleep_duration = resumed_at - suspend_started_at;
-    hadisplay::log_info("Kernel suspend cycle completed after " +
-                        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(sleep_duration).count()) +
-                        "ms");
-    return {
-        .ok = true,
-        .sleep_duration = sleep_duration,
-    };
+    return result;
 }
 
 void refresh_input_grabs(InputDevices& devices) {
@@ -1763,11 +2072,7 @@ int main() {
         if (scene_state.status == "STARTING") {
             scene_state.status = "SYNCING DEVICES";
         }
-        schedule_entity_refresh(async_state,
-                                ha_client,
-                                "DEVICES SYNCED",
-                                loaded_config.found ? "CONFIG EMPTY" : "SELECT LIGHTS");
-        schedule_weather_refresh(async_state, ha_client);
+        // Async HTTP work is started after the first render — see below.
     } else {
         scene_state.status = "CHECK CONFIG";
         scene_state.view_mode = hadisplay::ViewMode::Setup;
@@ -1794,8 +2099,14 @@ int main() {
         hadisplay::log_warn("No power button input discovered; suspend/resume will be unavailable");
     }
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    {
+        struct sigaction sa{};
+        sa.sa_handler = signal_handler;
+        sa.sa_flags = SA_RESTART;  // auto-restart interrupted syscalls (e.g. fb ioctls)
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
 
     clear_screen(fbfd, true, display_settings);
 
@@ -1809,6 +2120,14 @@ int main() {
 
     std::cerr << "hadisplay running. Screen: " << scene_state.width << "x"
               << scene_state.height << ". Input devices ready.\n";
+
+    if (ha_client.configured()) {
+        schedule_entity_refresh(async_state,
+                                ha_client,
+                                "DEVICES SYNCED",
+                                loaded_config.found ? "CONFIG EMPTY" : "SELECT LIGHTS");
+        schedule_weather_refresh(async_state, ha_client);
+    }
 
     TouchState touch{};
     PowerStateContext power_state{};
@@ -1972,14 +2291,24 @@ int main() {
                 update_clock_status(scene_state);
                 save_dirty_config(config_store, scene_state, config, config_dirty);
 
-                const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
-                if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
-                    break;
+                pause_runtime_services(power_state);
+                const bool will_kernel_suspend = kernel_suspend_supported(power_state, sleep_status);
+
+                // Render the sleep screen AFTER pausing services but only if
+                // we won't attempt kernel suspend. The full refresh leaves the
+                // hwtcon display controller with a pending "xon off" timer that
+                // blocks suspend. For kernel suspend, we skip the sleep screen
+                // so the display pipeline is idle when we write to /sys/power/state.
+                if (!will_kernel_suspend) {
+                    const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
+                    if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
+                        resume_runtime_services(power_state, device_status);
+                        break;
+                    }
                 }
 
-                pause_runtime_services(power_state);
-                if (kernel_suspend_supported(sleep_status)) {
-                    const SuspendResult suspend_result = suspend_to_ram();
+                if (will_kernel_suspend) {
+                    const SuspendResult suspend_result = suspend_to_ram(fbfd);
                     if (suspend_result.ok) {
                         refresh_input_grabs(input_devices);
                         touch = {};
@@ -2006,6 +2335,12 @@ int main() {
                             next_weather_refresh = now + std::chrono::seconds(5);
                         }
                     } else {
+                        if (!suspend_result.failure_reason.empty()) {
+                            power_state.kernel_suspend_blocked = true;
+                            power_state.kernel_suspend_block_reason = suspend_result.failure_reason;
+                            hadisplay::log_warn("Blocking further kernel suspend attempts: " +
+                                                power_state.kernel_suspend_block_reason);
+                        }
                         power_state.state = PowerState::Sleeping;
                         scene_state.status = "SLEEPING";
                         needs_redraw = false;

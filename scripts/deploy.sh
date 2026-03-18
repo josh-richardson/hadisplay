@@ -40,8 +40,10 @@ else
     BUILD_DIR="${BUILD_DIR}" HADISPLAY_JOBS="${JOBS}" "${SCRIPT_DIR}/build-kobo-in-docker.sh"
 fi
 
-# Stop the current app before updating the binary.
-ssh "${REMOTE}" "mkdir -p ${REMOTE_DIR}; killall hadisplay 2>/dev/null || true"
+# Stop the current app and its wrapper script. Killing just hadisplay causes
+# run-hadisplay.sh to restart Nickel, which grabs the framebuffer and leaves
+# the hwtcon display driver in a bad state for the next hadisplay instance.
+ssh "${REMOTE}" "mkdir -p ${REMOTE_DIR}; killall run-hadisplay.sh 2>/dev/null; killall hadisplay 2>/dev/null; sleep 1; killall -9 run-hadisplay.sh 2>/dev/null; true"
 
 # Deploy (--no-owner/--no-group/--no-perms avoids VFAT noise on the device).
 echo "Deploying to ${REMOTE}:${REMOTE_DIR}..."
