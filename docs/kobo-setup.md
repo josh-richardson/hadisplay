@@ -9,6 +9,8 @@ This is the working setup for deploying native `hadisplay` binaries to a Kobo ov
 - Native app payloads: `/mnt/onboard/.adds/`
 - Current app path: `/mnt/onboard/.adds/hadisplay/`
 
+This document is the Clara Colour reference setup. The shell entrypoints now read target metadata from `targets/*.env`, so the same workflow can be pointed at `ssh hackspace-kobo` with `--target hackspace-kobo`.
+
 ## Installed Components
 
 These were installed on the Kobo user storage and applied via reboot:

@@ -4,8 +4,35 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REMOTE="kobo"
-REMOTE_DIR="/mnt/onboard/.adds/hadisplay"
+# shellcheck disable=SC1090
+. "${SCRIPT_DIR}/hadisplay-target.sh"
+
+TARGET_NAME="${HADISPLAY_TARGET:-${HADISPLAY_DEFAULT_TARGET:-clara-colour}}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--target)
+            if [ $# -lt 2 ]; then
+                echo "Missing target name for $1" >&2
+                exit 1
+            fi
+            TARGET_NAME="$2"
+            shift 2
+            ;;
+        --target=*)
+            TARGET_NAME="${1#*=}"
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+hadisplay_load_target "${TARGET_NAME}" || exit 1
+
+REMOTE="${HADISPLAY_SSH_HOST}"
+REMOTE_DIR="${HADISPLAY_REMOTE_DIR}"
 
 detect_jobs() {
     if command -v nproc >/dev/null 2>&1; then
@@ -55,6 +82,14 @@ rsync -rtvP --inplace --no-perms --no-owner --no-group \
     --rsync-path=/usr/bin/rsync -e ssh \
     "${PROJECT_DIR}/scripts/run-hadisplay.sh" \
     "${REMOTE}:${REMOTE_DIR}/run-hadisplay.sh"
+rsync -rtvP --inplace --no-perms --no-owner --no-group \
+    --rsync-path=/usr/bin/rsync -e ssh \
+    "${PROJECT_DIR}/scripts/hadisplay-target.sh" \
+    "${REMOTE}:${REMOTE_DIR}/hadisplay-target.sh"
+rsync -rtvP --inplace --no-perms --no-owner --no-group \
+    --rsync-path=/usr/bin/rsync -e ssh \
+    "${PROJECT_DIR}/targets/${HADISPLAY_TARGET_NAME}.env" \
+    "${REMOTE}:${REMOTE_DIR}/target.env"
 if [ -f "${PROJECT_DIR}/.env" ]; then
     rsync -rtvP --inplace --no-perms --no-owner --no-group \
         --rsync-path=/usr/bin/rsync -e ssh \
@@ -66,8 +101,8 @@ fi
 
 # Restart on device.
 echo "Restarting hadisplay on device..."
-ssh "${REMOTE}" "mv ${REMOTE_DIR}/hadisplay.new ${REMOTE_DIR}/hadisplay && sleep 1 && cd ${REMOTE_DIR} && chmod +x hadisplay run-hadisplay.sh && > log.txt && nohup /bin/sh ./run-hadisplay.sh >> log.txt 2>&1 &"
+ssh "${REMOTE}" "mv ${REMOTE_DIR}/hadisplay.new ${REMOTE_DIR}/hadisplay && sleep 1 && cd ${REMOTE_DIR} && chmod +x hadisplay run-hadisplay.sh && > ${HADISPLAY_APP_LOG} && nohup /bin/sh ./run-hadisplay.sh >> ${HADISPLAY_APP_LOG} 2>&1 &"
 
 echo "Done. Tailing log..."
 sleep 1
-ssh "${REMOTE}" "cat ${REMOTE_DIR}/log.txt"
+ssh "${REMOTE}" "cat ${REMOTE_DIR}/${HADISPLAY_APP_LOG}"

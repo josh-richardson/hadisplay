@@ -6,9 +6,9 @@ It runs as a standalone app on the Kobo, takes over the screen while active, and
 
 ## Status
 
-- Only tested on the **Kobo Clara Colour N367B**.
-- It will likely **not** work on other Kobo models without additional development work.
-- Current device assumptions include Clara Colour framebuffer behavior, touch mapping, and backlight/status paths.
+- Tested on the **Kobo Clara Colour N367B** and an **i.MX6 / Nia-class Kobo on `ssh hackspace-kobo`**.
+- Device support is now target-driven. Clara Colour remains the default target when no target is specified.
+- Device-specific runtime assumptions live in `targets/*.env` instead of being hardcoded into the shell entrypoints.
 
 ## Current features
 
@@ -125,10 +125,19 @@ This will:
   - uses the native KOReader toolchain when it is available locally
   - otherwise falls back to the Docker-based Kobo build path, which is useful on macOS
 - copy `hadisplay` and `run-hadisplay.sh` to `/mnt/onboard/.adds/hadisplay/`
+- copy the selected target metadata to `/mnt/onboard/.adds/hadisplay/target.env`
 - restart the app on the device
 - tail the device log
 
-It expects `ssh kobo` to be configured.
+It defaults to the Clara Colour target and expects `ssh kobo` to be configured unless you pass another target.
+
+Examples:
+
+```bash
+./scripts/deploy.sh --target clara-colour
+./scripts/deploy.sh --target hackspace-kobo
+./scripts/logs.sh --target hackspace-kobo -f
+```
 
 ## Home Assistant configuration
 
@@ -196,6 +205,8 @@ menu_item:main:Hadisplay:cmd_spawn:quiet:exec /bin/sh /mnt/onboard/.adds/hadispl
 - pauses background Wi-Fi keepalive while the device is asleep
 - restarts Nickel when `hadisplay` exits
 
+`run-hadisplay.sh` now reads `/mnt/onboard/.adds/hadisplay/target.env` on-device so the launcher stays generic across Kobo models.
+
 While `hadisplay` is running, press the Kobo power button to sleep and press it again to wake.
 For normal use, launch via `run-hadisplay.sh`; the sleep feature also expects KOReader to remain installed because `hadisplay` reuses KOReader's Kobo Wi-Fi helper scripts during suspend and resume.
 
@@ -211,8 +222,12 @@ Manual launch is useful for debugging, but it does not provide the normal Nickel
 
 ## Device notes
 
-- Tested device: **Kobo Clara Colour N367B** / device code `393`
-- Screen: `1072x1448`
+- Target files:
+  - `targets/clara-colour.env`
+  - `targets/hackspace-kobo.env`
+- Test matrix:
+  - Clara Colour: device code `393`, `1072x1448`, `hwtcon`
+  - hackspace-kobo: device code `382`, `768x1024`, `mxc_epdc_fb`
 - Wi-Fi and some runtime libraries depend on the Kobo environment inherited from Nickel and Kobo Stuff
 - `ForceWifi=true` in `[DeveloperSettings]` is still useful for keeping Wi-Fi alive
 

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -278,6 +279,7 @@ struct DeviceStatus::Impl {
         }
 
         std::error_code ec;
+        int best_score = std::numeric_limits<int>::min();
         for (std::filesystem::directory_iterator it(root, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
             const auto& entry = *it;
             if (!entry.is_directory(ec)) {
@@ -288,8 +290,30 @@ struct DeviceStatus::Impl {
             const std::string type = lowercase_ascii(read_trimmed(dir / "type"));
             const std::string name = lowercase_ascii(dir.filename().string());
             if (type == "battery" || name == "battery" || name.find("bat") != std::string::npos) {
-                battery_supply_path = dir;
-                return;
+                int score = 0;
+                if (type == "battery") {
+                    score += 100;
+                }
+                if (name == "battery" || name.find("bat") != std::string::npos) {
+                    score += 50;
+                }
+                if (name.find("charger") != std::string::npos) {
+                    score -= 200;
+                }
+                if (path_exists(dir / "capacity")) {
+                    score += 100;
+                }
+                if (path_exists(dir / "charge_now") || path_exists(dir / "energy_now")) {
+                    score += 25;
+                }
+                if (path_exists(dir / "status")) {
+                    score += 10;
+                }
+
+                if (score > best_score) {
+                    best_score = score;
+                    battery_supply_path = dir;
+                }
             }
         }
     }

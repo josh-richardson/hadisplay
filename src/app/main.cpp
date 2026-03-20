@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "ha_client.h"
+#include "kobo_platform.h"
 #include "logger.h"
 #include "scene.h"
 #include "system_status.h"
@@ -45,15 +46,9 @@
 
 namespace {
 
-constexpr const char* kTouchDevice = "/dev/input/event1";
-constexpr const char* kKoreaderDir = "/mnt/onboard/.adds/koreader";
-constexpr const char* kKoreaderDisableWifiScript = "/mnt/onboard/.adds/koreader/disable-wifi.sh";
-constexpr const char* kKoreaderEnableWifiScript = "/mnt/onboard/.adds/koreader/enable-wifi.sh";
-constexpr const char* kKoreaderObtainIpScript = "/mnt/onboard/.adds/koreader/obtain-ip.sh";
-constexpr const char* kSuspendStatsPath = "/sys/kernel/debug/suspend_stats";
-constexpr const char* kWakeupSourcesPath = "/sys/kernel/debug/wakeup_sources";
-constexpr int kTouchMaxX = 1447;
-constexpr int kTouchMaxY = 1071;
+using hadisplay::InputDevice;
+using hadisplay::InputDevices;
+
 constexpr int kMaxPartialRefreshes = 12;
 constexpr auto kFullRefreshInterval = std::chrono::minutes(5);
 constexpr auto kNormalLightPollInterval = std::chrono::minutes(1);
@@ -104,20 +99,6 @@ struct PowerStateContext {
     bool kernel_sleep_hint_blocked = false;
     std::string kernel_suspend_block_reason;
     std::chrono::steady_clock::time_point ignore_power_until{};
-};
-
-struct InputDevice {
-    int fd = -1;
-    std::string path;
-    bool handles_touch = false;
-    bool handles_power = false;
-    bool grabbed = false;
-};
-
-struct InputDevices {
-    std::vector<InputDevice> devices;
-    int touch_index = -1;
-    int power_index = -1;
 };
 
 struct ClockStatus {
@@ -245,8 +226,8 @@ struct SuspendStatsSnapshot {
     int last_failed_errno = 0;
 };
 
-SuspendStatsSnapshot read_suspend_stats_snapshot() {
-    std::ifstream input(kSuspendStatsPath);
+SuspendStatsSnapshot read_suspend_stats_snapshot(const std::filesystem::path& suspend_stats_path) {
+    std::ifstream input(suspend_stats_path);
     if (!input) {
         return {};
     }
@@ -309,8 +290,9 @@ struct WakeupSourceState {
     unsigned long long active_since = 0;
 };
 
-WakeupSourceState read_named_wakeup_source(std::string_view source_name) {
-    std::ifstream input(kWakeupSourcesPath);
+WakeupSourceState read_named_wakeup_source(const std::filesystem::path& wakeup_sources_path,
+                                           std::string_view source_name) {
+    std::ifstream input(wakeup_sources_path);
     if (!input) {
         return {};
     }
@@ -341,9 +323,10 @@ WakeupSourceState read_named_wakeup_source(std::string_view source_name) {
     return {};
 }
 
-bool display_suspend_path_idle(std::string* busy_reason = nullptr) {
-    const WakeupSourceState hwtcon = read_named_wakeup_source("hwtcon_wakelock");
-    const WakeupSourceState cmdq = read_named_wakeup_source("cmdq_wakelock");
+bool display_suspend_path_idle(const hadisplay::DevicePlatform& platform,
+                               std::string* busy_reason = nullptr) {
+    const WakeupSourceState hwtcon = read_named_wakeup_source(platform.wakeup_sources_path, "hwtcon_wakelock");
+    const WakeupSourceState cmdq = read_named_wakeup_source(platform.wakeup_sources_path, "cmdq_wakelock");
     if (!hwtcon.seen && !cmdq.seen) {
         return true;
     }
@@ -371,7 +354,8 @@ bool display_suspend_path_idle(std::string* busy_reason = nullptr) {
     return busy_sources.empty();
 }
 
-bool wait_for_display_suspend_path_idle(std::chrono::steady_clock::duration timeout,
+bool wait_for_display_suspend_path_idle(const hadisplay::DevicePlatform& platform,
+                                        std::chrono::steady_clock::duration timeout,
                                         std::string* failure_reason = nullptr) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     int consecutive_idle_reads = 0;
@@ -379,7 +363,7 @@ bool wait_for_display_suspend_path_idle(std::chrono::steady_clock::duration time
 
     while (std::chrono::steady_clock::now() < deadline) {
         std::string busy_reason;
-        if (display_suspend_path_idle(&busy_reason)) {
+        if (display_suspend_path_idle(platform, &busy_reason)) {
             ++consecutive_idle_reads;
             if (consecutive_idle_reads >= 2) {
                 return true;
@@ -431,234 +415,6 @@ bool send_signal_to_keepalive(int signal_number, std::string_view action) {
 
     hadisplay::log_warn(std::string("Keepalive signal failed: ") + std::strerror(errno));
     return false;
-}
-
-bool run_command(const std::string& command, const std::string& description) {
-    hadisplay::log_info("Running " + description + ": " + command);
-    const int rc = std::system(command.c_str());
-    if (rc == 0) {
-        return true;
-    }
-
-    std::ostringstream error;
-    error << description << " failed";
-    if (rc == -1) {
-        error << ": " << std::strerror(errno);
-    } else if (WIFEXITED(rc)) {
-        error << " with exit code " << WEXITSTATUS(rc);
-    } else if (WIFSIGNALED(rc)) {
-        error << " with signal " << WTERMSIG(rc);
-    } else {
-        error << " with status " << rc;
-    }
-    hadisplay::log_warn(error.str());
-    return false;
-}
-
-std::string shell_escape_single_quotes(std::string_view value) {
-    std::string escaped;
-    escaped.reserve(value.size() + 8U);
-    for (const char ch : value) {
-        if (ch == '\'') {
-            escaped += "'\\''";
-        } else {
-            escaped.push_back(ch);
-        }
-    }
-    return escaped;
-}
-
-std::string wifi_interface_name() {
-    const char* raw = std::getenv("INTERFACE");
-    if (raw != nullptr && *raw != '\0') {
-        return raw;
-    }
-    return "wlan0";
-}
-
-bool disable_wifi_for_sleep() {
-    if (file_exists(kKoreaderDisableWifiScript)) {
-        const std::string command = "cd '" + shell_escape_single_quotes(kKoreaderDir) +
-                                    "' && /bin/sh '" + shell_escape_single_quotes(kKoreaderDisableWifiScript) + "'";
-        if (run_command(command, "KOReader Wi-Fi disable")) {
-            return true;
-        }
-    }
-
-    const std::string iface = wifi_interface_name();
-    const std::string command = "ifconfig '" + shell_escape_single_quotes(iface) + "' down >/dev/null 2>&1";
-    return run_command(command, "fallback Wi-Fi disable");
-}
-
-bool enable_wifi_after_sleep() {
-    if (file_exists(kKoreaderEnableWifiScript)) {
-        const std::string command = "cd '" + shell_escape_single_quotes(kKoreaderDir) +
-                                    "' && /bin/sh '" + shell_escape_single_quotes(kKoreaderEnableWifiScript) + "'";
-        if (run_command(command, "KOReader Wi-Fi enable")) {
-            return true;
-        }
-    }
-
-    const std::string iface = wifi_interface_name();
-    const std::string command = "ifconfig '" + shell_escape_single_quotes(iface) + "' up >/dev/null 2>&1";
-    return run_command(command, "fallback Wi-Fi enable");
-}
-
-bool obtain_ip_after_sleep() {
-    if (file_exists(kKoreaderObtainIpScript)) {
-        const std::string command = "cd '" + shell_escape_single_quotes(kKoreaderDir) +
-                                    "' && /bin/sh '" + shell_escape_single_quotes(kKoreaderObtainIpScript) + "'";
-        if (run_command(command, "KOReader obtain IP")) {
-            return true;
-        }
-    }
-
-    const std::string iface = wifi_interface_name();
-    const std::string command =
-        "if [ -x /sbin/dhcpcd ]; then "
-        "/sbin/dhcpcd -d -t 30 -w '" + shell_escape_single_quotes(iface) + "'; "
-        "else "
-        "udhcpc -S -i '" + shell_escape_single_quotes(iface) + "' -s /etc/udhcpc.d/default.script -b -q; "
-        "fi";
-    return run_command(command, "fallback obtain IP");
-}
-
-bool wait_for_wifi_association(std::chrono::seconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::FILE* pipe = popen("wpa_cli status 2>/dev/null", "r");
-        if (pipe != nullptr) {
-            std::string output;
-            std::array<char, 256> buffer{};
-            while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-                output += buffer.data();
-            }
-            const int rc = pclose(pipe);
-            if (rc == 0 && output.find("wpa_state=COMPLETED") != std::string::npos) {
-                hadisplay::log_info("Wi-Fi association completed");
-                return true;
-            }
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-
-    hadisplay::log_warn("Timed out waiting for Wi-Fi association");
-    return false;
-}
-
-bool restore_wifi_after_sleep() {
-    if (!enable_wifi_after_sleep()) {
-        return false;
-    }
-    if (!wait_for_wifi_association(std::chrono::seconds(15))) {
-        return false;
-    }
-    return obtain_ip_after_sleep();
-}
-
-std::vector<unsigned long> query_event_bits(int fd, int event_type, int max_code) {
-    const std::size_t bits_per_word = sizeof(unsigned long) * 8U;
-    const std::size_t word_count = (static_cast<std::size_t>(max_code) + bits_per_word) / bits_per_word;
-    std::vector<unsigned long> bits(word_count, 0UL);
-    if (bits.empty()) {
-        return bits;
-    }
-
-    const int rc = ioctl(fd, EVIOCGBIT(event_type, static_cast<int>(bits.size() * sizeof(unsigned long))), bits.data());
-    if (rc < 0) {
-        bits.clear();
-    }
-    return bits;
-}
-
-bool bit_is_set(const std::vector<unsigned long>& bits, int code) {
-    if (code < 0) {
-        return false;
-    }
-    const std::size_t bits_per_word = sizeof(unsigned long) * 8U;
-    const std::size_t word_index = static_cast<std::size_t>(code) / bits_per_word;
-    if (word_index >= bits.size()) {
-        return false;
-    }
-    const unsigned long mask = 1UL << (static_cast<unsigned int>(code) % bits_per_word);
-    return (bits[word_index] & mask) != 0UL;
-}
-
-InputDevices discover_input_devices() {
-    InputDevices discovered;
-    std::vector<std::filesystem::path> event_paths;
-
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it("/dev/input", ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
-        const auto& entry = *it;
-        const std::filesystem::path path = entry.path();
-        if (!entry.is_character_file(ec) && !entry.is_regular_file(ec)) {
-            continue;
-        }
-        const std::string filename = path.filename().string();
-        if (!filename.starts_with("event")) {
-            continue;
-        }
-        event_paths.push_back(path);
-    }
-
-    std::sort(event_paths.begin(), event_paths.end());
-
-    for (const auto& path : event_paths) {
-        const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
-        if (fd < 0) {
-            continue;
-        }
-
-        const std::vector<unsigned long> ev_bits = query_event_bits(fd, 0, EV_MAX);
-        const bool has_keys = bit_is_set(ev_bits, EV_KEY);
-        const bool has_abs = bit_is_set(ev_bits, EV_ABS);
-        const std::vector<unsigned long> key_bits = has_keys ? query_event_bits(fd, EV_KEY, KEY_MAX) : std::vector<unsigned long>{};
-        const std::vector<unsigned long> abs_bits = has_abs ? query_event_bits(fd, EV_ABS, ABS_MAX) : std::vector<unsigned long>{};
-
-        const bool handles_touch =
-            has_abs &&
-            (bit_is_set(abs_bits, ABS_MT_POSITION_X) || bit_is_set(abs_bits, ABS_X)) &&
-            (bit_is_set(abs_bits, ABS_MT_POSITION_Y) || bit_is_set(abs_bits, ABS_Y));
-        const bool handles_power = has_keys && bit_is_set(key_bits, KEY_POWER);
-
-        if (!handles_touch && !handles_power) {
-            close(fd);
-            continue;
-        }
-
-        InputDevice device;
-        device.fd = fd;
-        device.path = path.string();
-        device.handles_touch = handles_touch;
-        device.handles_power = handles_power;
-        discovered.devices.push_back(std::move(device));
-        const int index = static_cast<int>(discovered.devices.size()) - 1;
-
-        if (handles_touch && discovered.touch_index < 0) {
-            discovered.touch_index = index;
-        }
-        if (handles_power && discovered.power_index < 0) {
-            discovered.power_index = index;
-        }
-    }
-
-    if (discovered.touch_index < 0) {
-        const int fallback_fd = open(kTouchDevice, O_RDONLY | O_NONBLOCK);
-        if (fallback_fd >= 0) {
-            discovered.devices.push_back({
-                .fd = fallback_fd,
-                .path = kTouchDevice,
-                .handles_touch = true,
-                .handles_power = false,
-                .grabbed = false,
-            });
-            discovered.touch_index = static_cast<int>(discovered.devices.size()) - 1;
-        }
-    }
-
-    return discovered;
 }
 
 bool grab_input_device(InputDevice& device) {
@@ -861,11 +617,6 @@ void close_async_mailbox(AsyncState& async_state) {
 
 void signal_handler(int) {
     g_running = 0;
-}
-
-void map_touch_to_scene(int raw_x, int raw_y, int scene_w, int scene_h, int& out_x, int& out_y) {
-    out_x = (kTouchMaxY - raw_y) * scene_w / (kTouchMaxY + 1);
-    out_y = raw_x * scene_h / (kTouchMaxX + 1);
 }
 
 std::string concise_ha_error(const std::string& message) {
@@ -1563,18 +1314,21 @@ bool save_dirty_config(hadisplay::ConfigStore& config_store,
     return true;
 }
 
-void pause_runtime_services(PowerStateContext& power_state) {
+void pause_runtime_services(const hadisplay::DevicePlatform& platform,
+                            PowerStateContext& power_state) {
     if (!power_state.keepalive_paused) {
         power_state.keepalive_paused = send_signal_to_keepalive(SIGSTOP, "paused");
     }
     if (!power_state.wifi_disabled_for_sleep) {
-        power_state.wifi_disabled_for_sleep = disable_wifi_for_sleep();
+        power_state.wifi_disabled_for_sleep = hadisplay::disable_wifi_for_sleep(platform);
     }
 }
 
-void resume_runtime_services(PowerStateContext& power_state, hadisplay::DeviceStatus& device_status) {
+void resume_runtime_services(const hadisplay::DevicePlatform& platform,
+                             PowerStateContext& power_state,
+                             hadisplay::DeviceStatus& device_status) {
     if (power_state.wifi_disabled_for_sleep) {
-        if (!restore_wifi_after_sleep()) {
+        if (!hadisplay::restore_wifi_after_sleep(platform)) {
             hadisplay::log_warn("Wi-Fi restore after sleep failed");
         }
         power_state.wifi_disabled_for_sleep = false;
@@ -1587,6 +1341,7 @@ void resume_runtime_services(PowerStateContext& power_state, hadisplay::DeviceSt
 }
 
 bool kernel_suspend_supported(const PowerStateContext& power_state,
+                              const hadisplay::DevicePlatform& platform,
                               const hadisplay::SystemStatus& system_status) {
     if (system_status.battery_charging) {
         hadisplay::log_info("Kernel suspend skipped while charging");
@@ -1594,6 +1349,10 @@ bool kernel_suspend_supported(const PowerStateContext& power_state,
     }
     if (power_state.kernel_suspend_blocked) {
         hadisplay::log_warn("Kernel suspend disabled for this session: " + power_state.kernel_suspend_block_reason);
+        return false;
+    }
+    if (!platform.supports_kernel_suspend) {
+        hadisplay::log_info("Kernel suspend unavailable on this device family; using software sleep");
         return false;
     }
     if (!file_exists("/sys/power/state") || !file_exists("/sys/power/state-extended")) {
@@ -1615,7 +1374,7 @@ struct SuspendResult {
     std::string failure_reason;
 };
 
-SuspendResult suspend_to_ram(int fbfd) {
+SuspendResult suspend_to_ram(const hadisplay::DevicePlatform& platform, int fbfd) {
     if (!wait_for_fbink_update_completion(fbfd, "pre-suspend")) {
         return {
             .ok = false,
@@ -1632,7 +1391,8 @@ SuspendResult suspend_to_ram(int fbfd) {
     std::this_thread::sleep_for(kSuspendScreenSettleDelay);
     (void)wait_for_fbink_update_completion(fbfd, "state-extended suspend settle");
     std::string display_idle_failure;
-    if (!wait_for_display_suspend_path_idle(kDisplayIdleTimeout, &display_idle_failure)) {
+    if (platform.supports_display_idle_check &&
+        !wait_for_display_suspend_path_idle(platform, kDisplayIdleTimeout, &display_idle_failure)) {
         hadisplay::log_warn("Kernel suspend skipped: " + display_idle_failure);
         write_trimmed_file("/sys/power/state-extended", "0");
         return {
@@ -1643,16 +1403,18 @@ SuspendResult suspend_to_ram(int fbfd) {
     }
 
     int32_t saved_pwrdown_delay = -1;
-    if (ioctl(fbfd, HWTCON_GET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
-        hadisplay::log_warn("HWTCON_GET_PWRDOWN_DELAY failed: " + std::string(strerror(errno)));
-        saved_pwrdown_delay = 500;
-    }
-    int32_t zero_delay = 0;
-    if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &zero_delay) < 0) {
-        hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY(0) failed: " + std::string(strerror(errno)));
-    } else if (saved_pwrdown_delay != 0) {
-        hadisplay::log_info("Set hwtcon power-down delay to 0ms (was " +
-                            std::to_string(saved_pwrdown_delay) + "ms)");
+    if (platform.supports_hwtcon_powerdown_delay) {
+        if (ioctl(fbfd, HWTCON_GET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
+            hadisplay::log_warn("HWTCON_GET_PWRDOWN_DELAY failed: " + std::string(strerror(errno)));
+            saved_pwrdown_delay = 500;
+        }
+        int32_t zero_delay = 0;
+        if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &zero_delay) < 0) {
+            hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY(0) failed: " + std::string(strerror(errno)));
+        } else if (saved_pwrdown_delay != 0) {
+            hadisplay::log_info("Set hwtcon power-down delay to 0ms (was " +
+                                std::to_string(saved_pwrdown_delay) + "ms)");
+        }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(900));
 
@@ -1661,7 +1423,7 @@ SuspendResult suspend_to_ram(int fbfd) {
     // Retry suspend up to kSuspendRetryCount times.
     SuspendResult result;
     for (int attempt = 0; attempt < kSuspendRetryCount; ++attempt) {
-        const SuspendStatsSnapshot stats_before = read_suspend_stats_snapshot();
+        const SuspendStatsSnapshot stats_before = read_suspend_stats_snapshot(platform.suspend_stats_path);
         const auto suspend_started_at = std::chrono::steady_clock::now();
 
         if (!write_trimmed_file("/sys/power/state", "mem")) {
@@ -1671,7 +1433,7 @@ SuspendResult suspend_to_ram(int fbfd) {
         }
         const auto resumed_at = std::chrono::steady_clock::now();
         const auto sleep_duration = resumed_at - suspend_started_at;
-        const SuspendStatsSnapshot stats_after = read_suspend_stats_snapshot();
+        const SuspendStatsSnapshot stats_after = read_suspend_stats_snapshot(platform.suspend_stats_path);
 
         if (stats_before.available && stats_after.available) {
             const std::string failure_reason = describe_suspend_failure(stats_before, stats_after);
@@ -1711,7 +1473,7 @@ SuspendResult suspend_to_ram(int fbfd) {
         hadisplay::log_warn("Failed to write /sys/power/state-extended=0 after resume");
     }
 
-    if (saved_pwrdown_delay >= 0) {
+    if (platform.supports_hwtcon_powerdown_delay && saved_pwrdown_delay >= 0) {
         if (ioctl(fbfd, HWTCON_SET_PWRDOWN_DELAY, &saved_pwrdown_delay) < 0) {
             hadisplay::log_warn("HWTCON_SET_PWRDOWN_DELAY restore failed: " + std::string(strerror(errno)));
         } else {
@@ -2066,6 +1828,9 @@ int main() {
 
     FBInkState fb_state{};
     fbink_get_state(&fbink_cfg, &fb_state);
+    const std::string framebuffer_name = read_trimmed_file("/sys/class/graphics/fb0/name");
+    const hadisplay::DevicePlatform platform =
+        hadisplay::probe_device_platform(framebuffer_name, static_cast<int>(fb_state.view_width), static_cast<int>(fb_state.view_height));
 
     hadisplay::SceneState scene_state{};
     scene_state.width = static_cast<int>(fb_state.view_width);
@@ -2096,7 +1861,8 @@ int main() {
                 << " display=" << (display_settings.effective_mode == hadisplay::DisplayMode::Color ? "color" : "grayscale")
                 << " entities=" << config.selected_entity_ids.size()
                 << " wifi=" << scene_state.wifi_label
-                << " battery=" << scene_state.battery_label;
+                << " battery=" << scene_state.battery_label
+                << " " << hadisplay::describe_device_platform(platform);
         hadisplay::log_info(startup.str());
     }
 
@@ -2126,7 +1892,7 @@ int main() {
 
     std::vector<hadisplay::Button> buttons = hadisplay::buttons_for(scene_state);
 
-    InputDevices input_devices = discover_input_devices();
+    InputDevices input_devices = hadisplay::discover_input_devices(platform);
     if (input_devices.touch_index < 0) {
         std::cerr << "Failed to discover a touch input device.\n";
         close_async_mailbox(async_state);
@@ -2275,10 +2041,16 @@ int main() {
                             touch.touching = true;
                         } else if (ev.value == 0 && touch.touching) {
                             touch.touching = false;
-                            if (touch.x >= 0 && touch.y >= 0) {
+                            if (touch.x >= 0 && touch.y >= 0 && device.touch_transform.has_value()) {
                                 int sx = 0;
                                 int sy = 0;
-                                map_touch_to_scene(touch.x, touch.y, scene_state.width, scene_state.height, sx, sy);
+                                hadisplay::map_touch_to_scene(*device.touch_transform,
+                                                              touch.x,
+                                                              touch.y,
+                                                              scene_state.width,
+                                                              scene_state.height,
+                                                              sx,
+                                                              sy);
                                 const int released_on = hadisplay::button_at(buttons, sx, sy);
                                 if (scene_state.pressed_button >= 0 && scene_state.pressed_button == released_on) {
                                     pending_button = buttons[static_cast<std::size_t>(released_on)];
@@ -2290,10 +2062,16 @@ int main() {
                             touch.y = -1;
                         }
                     } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-                        if (touch.touching && touch.x >= 0 && touch.y >= 0) {
+                        if (touch.touching && touch.x >= 0 && touch.y >= 0 && device.touch_transform.has_value()) {
                             int sx = 0;
                             int sy = 0;
-                            map_touch_to_scene(touch.x, touch.y, scene_state.width, scene_state.height, sx, sy);
+                            hadisplay::map_touch_to_scene(*device.touch_transform,
+                                                          touch.x,
+                                                          touch.y,
+                                                          scene_state.width,
+                                                          scene_state.height,
+                                                          sx,
+                                                          sy);
                             const int pressed = hadisplay::button_at(buttons, sx, sy);
                             if (pressed != scene_state.pressed_button) {
                                 scene_state.pressed_button = pressed;
@@ -2322,7 +2100,7 @@ int main() {
                 if (!render_resume_hint(fbfd, display_settings)) {
                     hadisplay::log_warn("Failed to render resume hint");
                 }
-                resume_runtime_services(power_state, device_status);
+                resume_runtime_services(platform, power_state, device_status);
                 refresh_input_grabs(input_devices);
                 apply_system_status(scene_state, device_status.snapshot());
                 update_clock_status(scene_state);
@@ -2340,14 +2118,16 @@ int main() {
                 update_clock_status(scene_state);
                 save_dirty_config(config_store, scene_state, config, config_dirty);
 
-                pause_runtime_services(power_state);
-                const bool will_kernel_suspend = kernel_suspend_supported(power_state, sleep_status);
+                pause_runtime_services(platform, power_state);
+                const bool will_kernel_suspend = kernel_suspend_supported(power_state, platform, sleep_status);
                 const bool show_kernel_sleep_hint =
-                    will_kernel_suspend && !power_state.kernel_sleep_hint_blocked;
+                    will_kernel_suspend &&
+                    platform.supports_hwtcon_powerdown_delay &&
+                    !power_state.kernel_sleep_hint_blocked;
 
                 const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
                 if (!will_kernel_suspend && !render_sleep_screen(fbfd, display_settings, sleep_detail)) {
-                    resume_runtime_services(power_state, device_status);
+                    resume_runtime_services(platform, power_state, device_status);
                     break;
                 }
 
@@ -2367,7 +2147,7 @@ int main() {
                     } else {
                         hadisplay::log_info("Skipping kernel sleep hint after earlier hwtcon suspend failure");
                     }
-                    const SuspendResult suspend_result = suspend_to_ram(fbfd);
+                    const SuspendResult suspend_result = suspend_to_ram(platform, fbfd);
                     if (suspend_result.ok) {
                         refresh_input_grabs(input_devices);
                         touch = {};
@@ -2378,7 +2158,7 @@ int main() {
                         // Any wake from a successful kernel suspend is
                         // legitimate — resume immediately.
                         power_state.state = PowerState::Awake;
-                        resume_runtime_services(power_state, device_status);
+                        resume_runtime_services(platform, power_state, device_status);
                         // Drain any queued input events (the power button
                         // press that woke the device from suspend) and set
                         // an ignore window as a safety net.
@@ -2504,7 +2284,7 @@ int main() {
         }
     }
 
-    resume_runtime_services(power_state, device_status);
+    resume_runtime_services(platform, power_state, device_status);
 
     if (config_dirty) {
         std::string error;
