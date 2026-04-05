@@ -17,6 +17,11 @@ struct Rect {
 enum class ButtonId {
     BrightnessToggle = 0,
     DevModeToggle,
+    PowerMenuToggle,
+    PowerMenuDebugLog,
+    PowerMenuSleep,
+    PowerMenuExit,
+    PowerMenuShutdown,
     SetupToggleLight,
     SetupOpenRoom,
     SetupCycleBrowseMode,
@@ -32,6 +37,9 @@ enum class ButtonId {
     DashboardConfigure,
     DashboardRefresh,
     DetailBack,
+    DebugLogScrollUp,
+    DebugLogScrollDown,
+    DebugLogClose,
     DetailToggleLight,
     DetailBrightnessDown,
     DetailBrightnessUp,
@@ -55,6 +63,7 @@ enum class ViewMode {
     Setup = 0,
     Dashboard,
     Detail,
+    DebugLog,
 };
 
 enum class SetupTypeFilter {
@@ -153,9 +162,12 @@ struct EntityItem {
 struct SceneState {
     int width = 1024;
     int height = 768;
+    bool compact_ui = false;
+    bool power_menu_open = false;
     int pressed_button = -1;
     int selected_button = -1;
     ViewMode view_mode = ViewMode::Setup;
+    ViewMode debug_log_return_view_mode = ViewMode::Setup;
     std::vector<EntityItem> entities;
     int setup_page = 0;
     SetupTypeFilter setup_type_filter = SetupTypeFilter::All;
@@ -185,11 +197,15 @@ struct SceneState {
     std::vector<double> detail_history_values;
     double detail_history_min = 0.0;
     double detail_history_max = 0.0;
+    int debug_log_scroll = 0;
+    bool debug_log_truncated = false;
+    std::vector<std::string> debug_log_lines;
     std::string status = "STARTING";
 };
 
 std::vector<Button> buttons_for(const SceneState& state);
-int button_at(const std::vector<Button>& buttons, int x, int y);
+int button_at(const SceneState& state, const std::vector<Button>& buttons, int x, int y);
+int debug_log_page_size(const SceneState& state);
 RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& buttons, PixelFormat pixel_format);
 
 }  // namespace hadisplay

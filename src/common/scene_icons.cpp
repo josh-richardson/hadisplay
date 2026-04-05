@@ -78,6 +78,19 @@ void draw_wrench_icon(RenderBuffer& buffer,
     fill_rect(buffer, width, height, {left - 2, bottom - 8, 10, 10}, value);
 }
 
+void draw_power_icon(RenderBuffer& buffer,
+                     int width,
+                     int height,
+                     const Rect& rect,
+                     Color value) {
+    const int size = std::min(rect.width, rect.height);
+    const int cx = rect.x + (rect.width / 2) - 1;
+    const int cy = rect.y + (rect.height / 2);
+    const int radius = std::max(7, (size / 2) - 10);
+    draw_arc(buffer, width, height, cx, cy, radius, kPi * 1.8, kPi * 3.2, 3, value);
+    draw_line(buffer, width, height, cx, rect.y + std::max(6, size / 5), cx, cy - radius / 2, 3, value);
+}
+
 void draw_cog_icon(RenderBuffer& buffer,
                    int width,
                    int height,

@@ -1,6 +1,7 @@
 build*/
 .deps/
 .env
+.hadisplay-config.json
 output/*
 !output/.gitkeep
 .claude

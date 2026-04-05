@@ -191,6 +191,21 @@ bool wait_for_wifi_association(std::chrono::seconds timeout) {
     return false;
 }
 
+std::string read_command_output(const char* command) {
+    std::FILE* pipe = popen(command, "r");
+    if (pipe == nullptr) {
+        return {};
+    }
+
+    std::string output;
+    std::array<char, 256> buffer{};
+    while (std::fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+    pclose(pipe);
+    return output;
+}
+
 std::vector<unsigned long> query_event_bits(int fd, int event_type, int max_code) {
     const std::size_t bits_per_word = sizeof(unsigned long) * 8U;
     const std::size_t word_count = (static_cast<std::size_t>(max_code) + bits_per_word) / bits_per_word;
@@ -318,6 +333,8 @@ DevicePlatform probe_device_platform(std::string_view framebuffer_name, int view
                model_name.find("freescale") != std::string::npos ||
                model_name.find("ntx") != std::string::npos) {
         platform.family = KoboDeviceFamily::IMxEpdc;
+        platform.supports_kernel_suspend = path_exists("/sys/power/state") && path_exists("/sys/power/state-extended");
+        platform.supports_suspend_debug_paths = path_exists(platform.suspend_stats_path) && path_exists(platform.wakeup_sources_path);
     }
 
     return platform;
@@ -463,6 +480,38 @@ std::string wifi_interface_name() {
         return raw;
     }
     return "wlan0";
+}
+
+std::string current_wifi_ssid() {
+    {
+        std::istringstream lines(read_command_output("wpa_cli status 2>/dev/null"));
+        std::string line;
+        while (std::getline(lines, line)) {
+            if (line.rfind("ssid=", 0) == 0) {
+                return trim(line.substr(5));
+            }
+        }
+    }
+
+    {
+        std::istringstream lines(read_command_output("iwconfig 2>/dev/null"));
+        std::string line;
+        while (std::getline(lines, line)) {
+            const std::size_t essid = line.find("ESSID:");
+            if (essid == std::string::npos) {
+                continue;
+            }
+            std::size_t start = essid + 6;
+            if (start < line.size() && line[start] == '"') {
+                ++start;
+                const std::size_t end = line.find('"', start);
+                return trim(line.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            }
+            return trim(line.substr(start));
+        }
+    }
+
+    return {};
 }
 
 bool disable_wifi_for_sleep(const DevicePlatform& platform) {

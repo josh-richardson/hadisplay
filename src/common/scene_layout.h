@@ -10,6 +10,7 @@ struct SceneLayout {
     Rect header;
     Rect body;
     Rect footer;
+    Rect power_button;
     Rect brightness_button;
     Rect dev_button;
     Rect wifi_button;
@@ -18,7 +19,7 @@ struct SceneLayout {
     Rect weather_rect;
 };
 
-SceneLayout make_scene_layout(int width, int height);
+SceneLayout make_scene_layout(int width, int height, bool compact_ui = false);
 Rect grid_cell(const Rect& bounds, int columns, int rows, int column, int row, int gutter);
 
 }  // namespace hadisplay::scene

@@ -18,12 +18,16 @@ LOGFILE="${HADISPLAY_DIR}/${HADISPLAY_APP_LOG}"
 ORIG_LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 HADISPLAY_LD_LIBRARY_PATH="${HADISPLAY_LD_LIBRARY_PATH}"
 NICKEL_ENV_PID=""
+HADISPLAY_EXIT_SHUTDOWN=64
 
 # Siphon env from Nickel before we kill it (needed for WiFi, dbus, etc.)
 if pkill -0 nickel 2>/dev/null; then
     NICKEL_ENV_PID="$(pidof -s nickel)"
-    eval "$(grep -s -E -e '^(DBUS_SESSION_BUS_ADDRESS|NICKEL_HOME|WIFI_MODULE|LANG|INTERFACE|PLATFORM|QT_GSTREAMER_PLAYBIN_AUDIOSINK|QT_GSTREAMER_PLAYBIN_AUDIOSINK_DEVICE_PARAMETER|PATH)=' \
-        "/proc/${NICKEL_ENV_PID}/environ" | sed 's/^/export /')"
+    # Capture ALL of Nickel's environment, not just a subset.
+    # Missing variables (especially PRODUCT) can prevent Nickel from
+    # rendering correctly on restart.  Filter for valid KEY=VALUE lines
+    # to avoid breakage from multi-line values or binary data.
+    eval "$(tr '\0' '\n' < "/proc/${NICKEL_ENV_PID}/environ" | grep -E '^[A-Za-z_][A-Za-z_0-9]*=' | sed "s/'/'\\\\''/g; s/=\\(.*\\)/='\\1'/" | sed 's/^/export /')"
 
     sync
 
@@ -133,13 +137,117 @@ fi
 kill "$KEEPALIVE_PID" 2>/dev/null
 wait "$KEEPALIVE_PID" 2>/dev/null
 
-# Restart Nickel.
+if [ "${RETVAL}" -eq "${HADISPLAY_EXIT_SHUTDOWN}" ]; then
+    log_msg "hadisplay requested device shutdown"
+    sync
+    if poweroff >>"${LOGFILE}" 2>&1; then
+        exit 0
+    else
+        log_warn "poweroff failed, falling back to Nickel restart"
+    fi
+fi
+
+# Tear down WiFi before restarting Nickel.
+# Nickel does not handle a pre-existing WiFi connection gracefully and will
+# fail to repaint the framebuffer if WiFi is still up (KOReader #1520).
+TEARDOWN_IFACE="${INTERFACE:-${WIFI_IFACE}}"
+if [ -n "${WIFI_MODULE}" ] && grep -q "^${WIFI_MODULE} " "/proc/modules"; then
+    log_msg "Tearing down WiFi before Nickel restart (module: ${WIFI_MODULE}, iface: ${TEARDOWN_IFACE})"
+
+    if [ -x "/sbin/dhcpcd" ]; then
+        dhcpcd -d -k "${TEARDOWN_IFACE}" 2>/dev/null
+        killall -q -TERM udhcpc default.script
+    else
+        killall -q -TERM udhcpc default.script dhcpcd
+    fi
+
+    kill_timeout=0
+    while pkill -0 udhcpc 2>/dev/null; do
+        if [ ${kill_timeout} -ge 20 ]; then
+            break
+        fi
+        usleep 250000
+        kill_timeout=$((kill_timeout + 1))
+    done
+
+    wpa_cli -i "${TEARDOWN_IFACE}" terminate 2>/dev/null
+
+    [ "${WIFI_MODULE}" = "dhd" ] && wlarm_le -i "${TEARDOWN_IFACE}" down 2>/dev/null
+    ifconfig "${TEARDOWN_IFACE}" down 2>/dev/null
+
+    WIFI_DEP_MOD=""
+    POWER_TOGGLE="module"
+    SKIP_UNLOAD=""
+    case "${WIFI_MODULE}" in
+        "moal")
+            WIFI_DEP_MOD="mlan"
+            POWER_TOGGLE="ntx_io"
+            ;;
+        "wlan_drv_gen4m")
+            POWER_TOGGLE="wmt"
+            SKIP_UNLOAD="true"
+            ;;
+    esac
+
+    if [ -z "${SKIP_UNLOAD}" ]; then
+        usleep 250000
+        rmmod "${WIFI_MODULE}" 2>/dev/null
+        if [ -n "${WIFI_DEP_MOD}" ] && grep -q "^${WIFI_DEP_MOD} " "/proc/modules"; then
+            usleep 250000
+            rmmod "${WIFI_DEP_MOD}" 2>/dev/null
+        fi
+    fi
+
+    case "${POWER_TOGGLE}" in
+        "ntx_io")
+            log_warn "ntx_io power toggle required but no tool available; skipping"
+            ;;
+        "wmt")
+            echo 0 >/dev/wmtWifi 2>/dev/null
+            ;;
+        *)
+            if grep -q "^sdio_wifi_pwr " "/proc/modules"; then
+                # Restore Nickel-expected CPU frequency scaling on DVFS-capable i.MX devices.
+                if [ -e "/sys/devices/platform/mxc_dvfs_core.0/enable" ]; then
+                    echo "0" >"/sys/devices/platform/mxc_dvfs_core.0/enable"
+                    echo "userspace" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+                    cat "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq" >"/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed"
+                fi
+                usleep 250000
+                rmmod sdio_wifi_pwr 2>/dev/null
+            fi
+            ;;
+    esac
+else
+    log_msg "WiFi module not loaded, skipping teardown"
+fi
+
+# Restart Nickel. Mirror Kobo's stock rcS launch path closely enough to avoid
+# leaving Nickel on a blank framebuffer on the i.MX EPDC devices.
+log_msg "Restarting Nickel via builtin launcher path"
 export LD_LIBRARY_PATH="/usr/local/Kobo"
+cd /
+unset OLDPWD LC_ALL STARDICT_DATA_DIR EXT_FONT_DIR KO_DONT_GRAB_INPUT FBINK_FORCE_ROTA
+(
+    if [ "${PLATFORM}" = "freescale" ] || [ "${PLATFORM}" = "mx50-ntx" ] || [ "${PLATFORM}" = "mx6sl-ntx" ]; then
+        usleep 400000
+    fi
+    /etc/init.d/on-animator.sh >>"${LOGFILE}" 2>&1
+) &
+
 rm -f /tmp/nickel-hardware-status
 mkfifo /tmp/nickel-hardware-status
+
+# Flush before launching Nickel.
+sync
+
+# Unmount SD card if present so Nickel can detect and mount it cleanly.
+if [ -e "/dev/mmcblk1p1" ]; then
+    umount /mnt/sd 2>/dev/null
+fi
+
 /usr/local/Kobo/hindenburg >>"${LOGFILE}" 2>&1 &
 LIBC_FATAL_STDERR_=1 "${NICKEL_BIN}" -platform kobo -skipFontLoad >>"${LOGFILE}" 2>&1 &
 [ "${PLATFORM}" != "freescale" ] && udevadm trigger >>"${LOGFILE}" 2>&1 &
-sync
 
 exit ${RETVAL}

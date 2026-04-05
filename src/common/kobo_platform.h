@@ -75,6 +75,7 @@ bool map_touch_to_scene(const TouchTransform& transform,
                         int& out_y);
 
 std::string wifi_interface_name();
+std::string current_wifi_ssid();
 bool disable_wifi_for_sleep(const DevicePlatform& platform);
 bool enable_wifi_after_sleep(const DevicePlatform& platform);
 bool obtain_ip_after_sleep(const DevicePlatform& platform);

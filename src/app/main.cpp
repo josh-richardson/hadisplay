@@ -65,6 +65,7 @@ constexpr auto kPostResumePowerIgnoreWindow = std::chrono::seconds(2);
 constexpr int kSuspendRetryCount = 3;
 constexpr auto kSuspendRetryDelay = std::chrono::milliseconds(1500);
 constexpr auto kKernelSleepHintSettleDelay = std::chrono::seconds(5);
+constexpr std::size_t kMaxDebugLogLines = 2000;
 
 volatile sig_atomic_t g_running = 1;
 
@@ -89,6 +90,13 @@ struct DisplaySettings {
 enum class PowerState {
     Awake = 0,
     Sleeping,
+};
+
+enum class AppAction {
+    None = 0,
+    ExitToNickel,
+    Sleep,
+    Shutdown,
 };
 
 struct PowerStateContext {
@@ -152,6 +160,8 @@ struct EntityActionCompletion {
 };
 
 using AsyncCompletion = std::variant<EntityRefreshCompletion, WeatherRefreshCompletion, EntityActionCompletion, SensorHistoryCompletion>;
+
+constexpr int kHadisplayExitShutdown = 64;
 
 struct AsyncMailbox {
     std::mutex mutex;
@@ -627,7 +637,8 @@ std::string concise_ha_error(const std::string& message) {
         return value;
     }(message);
 
-    if (lower.find(".env") != std::string::npos || lower.find("ha_url") != std::string::npos ||
+    if (lower.find("config json") != std::string::npos || lower.find("ha_url") != std::string::npos ||
+        lower.find("location") != std::string::npos ||
         lower.find("ha_token") != std::string::npos) {
         return "CHECK CONFIG";
     }
@@ -867,6 +878,43 @@ bool apply_entity_list_result(hadisplay::SceneState& scene_state,
 
 bool has_selected_entities(const hadisplay::AppConfig& config) {
     return !config.selected_entity_ids.empty();
+}
+
+void load_debug_log(hadisplay::SceneState& scene_state) {
+    std::ifstream input("hadisplay.log");
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        lines.push_back(line);
+    }
+
+    scene_state.debug_log_truncated = lines.size() > kMaxDebugLogLines;
+    if (scene_state.debug_log_truncated) {
+        lines.erase(lines.begin(), lines.end() - static_cast<std::ptrdiff_t>(kMaxDebugLogLines));
+    }
+
+    scene_state.debug_log_lines = std::move(lines);
+    const int page_size = hadisplay::debug_log_page_size(scene_state);
+    scene_state.debug_log_scroll = std::max(0, static_cast<int>(scene_state.debug_log_lines.size()) - page_size);
+}
+
+void restore_view_from_debug_log(hadisplay::SceneState& scene_state) {
+    scene_state.view_mode = scene_state.debug_log_return_view_mode;
+    switch (scene_state.view_mode) {
+        case hadisplay::ViewMode::Detail:
+            scene_state.status = "DETAIL VIEW";
+            break;
+        case hadisplay::ViewMode::Dashboard:
+            scene_state.status = "DASHBOARD";
+            break;
+        case hadisplay::ViewMode::Setup:
+            scene_state.status = "SETUP VIEW";
+            break;
+        case hadisplay::ViewMode::DebugLog:
+            scene_state.view_mode = hadisplay::ViewMode::Dashboard;
+            scene_state.status = "DASHBOARD";
+            break;
+    }
 }
 
 void schedule_entity_refresh(AsyncState& async_state,
@@ -1315,7 +1363,9 @@ bool save_dirty_config(hadisplay::ConfigStore& config_store,
 }
 
 void pause_runtime_services(const hadisplay::DevicePlatform& platform,
-                            PowerStateContext& power_state) {
+                            PowerStateContext& power_state,
+                            hadisplay::DeviceStatus& device_status) {
+    device_status.save_and_disable_brightness();
     if (!power_state.keepalive_paused) {
         power_state.keepalive_paused = send_signal_to_keepalive(SIGSTOP, "paused");
     }
@@ -1337,7 +1387,7 @@ void resume_runtime_services(const hadisplay::DevicePlatform& platform,
         send_signal_to_keepalive(SIGCONT, "resumed");
         power_state.keepalive_paused = false;
     }
-    (void)device_status;
+    device_status.restore_brightness();
 }
 
 bool kernel_suspend_supported(const PowerStateContext& power_state,
@@ -1504,17 +1554,17 @@ void drain_input_events(InputDevices& devices) {
     }
 }
 
-bool handle_button_action(hadisplay::SceneState& scene_state,
-                          std::vector<hadisplay::Button>& buttons,
-                          const ha::Client& ha_client,
-                          hadisplay::DeviceStatus& device_status,
-                          hadisplay::ConfigStore& config_store,
-                          hadisplay::AppConfig& config,
-                          AsyncState& async_state,
-                          bool& config_dirty,
-                          const hadisplay::Button& action_button,
-                          bool& needs_redraw,
-                          bool& force_full_refresh) {
+AppAction handle_button_action(hadisplay::SceneState& scene_state,
+                               const std::vector<hadisplay::Button>& buttons,
+                               const ha::Client& ha_client,
+                               hadisplay::DeviceStatus& device_status,
+                               hadisplay::ConfigStore& config_store,
+                               hadisplay::AppConfig& config,
+                               AsyncState& async_state,
+                               bool& config_dirty,
+                               const hadisplay::Button& action_button,
+                               bool& needs_redraw,
+                               bool& force_full_refresh) {
     int selected_button_index = -1;
     for (std::size_t i = 0; i < buttons.size(); ++i) {
         if (buttons[i].id == action_button.id &&
@@ -1532,17 +1582,47 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
             hadisplay::SystemStatus system_status;
             if (!device_status.cycle_brightness(system_status)) {
                 needs_redraw = true;
-                return false;
+                return AppAction::None;
             }
 
             apply_system_status(scene_state, system_status);
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         }
+        case hadisplay::ButtonId::PowerMenuToggle:
+            scene_state.power_menu_open = !scene_state.power_menu_open;
+            needs_redraw = true;
+            return AppAction::None;
+        case hadisplay::ButtonId::PowerMenuDebugLog:
+            scene_state.power_menu_open = false;
+            scene_state.debug_log_return_view_mode = scene_state.view_mode == hadisplay::ViewMode::DebugLog
+                ? hadisplay::ViewMode::Dashboard
+                : scene_state.view_mode;
+            scene_state.view_mode = hadisplay::ViewMode::DebugLog;
+            load_debug_log(scene_state);
+            scene_state.status = "DEBUG LOG";
+            needs_redraw = true;
+            return AppAction::None;
+        case hadisplay::ButtonId::PowerMenuSleep:
+            scene_state.power_menu_open = false;
+            scene_state.status = "SLEEPING";
+            return AppAction::Sleep;
+        case hadisplay::ButtonId::PowerMenuExit:
+            scene_state.power_menu_open = false;
+            scene_state.status = "EXITING TO GUI";
+            force_full_refresh = true;
+            needs_redraw = true;
+            return AppAction::ExitToNickel;
+        case hadisplay::ButtonId::PowerMenuShutdown:
+            scene_state.power_menu_open = false;
+            scene_state.status = "SHUTTING DOWN";
+            force_full_refresh = true;
+            needs_redraw = true;
+            return AppAction::Shutdown;
         case hadisplay::ButtonId::DevModeToggle:
             scene_state.dev_mode = !scene_state.dev_mode;
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupToggleLight:
             if (action_button.value >= 0 && action_button.value < static_cast<int>(scene_state.entities.size())) {
                 scene_state.entities[static_cast<std::size_t>(action_button.value)].selected =
@@ -1551,41 +1631,41 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 scene_state.status = "SELECTION UPDATED";
                 needs_redraw = true;
             }
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupOpenRoom:
             scene_state.setup_room_label = action_button.label;
             scene_state.setup_page = 0;
             scene_state.status = "ROOM DEVICES";
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupCycleBrowseMode:
             if (scene_state.setup_browse_mode == hadisplay::SetupBrowseMode::Rooms && !scene_state.setup_room_label.empty()) {
                 scene_state.setup_room_label.clear();
                 scene_state.setup_page = 0;
                 scene_state.status = "ROOM LIST";
                 needs_redraw = true;
-                return false;
+                return AppAction::None;
             }
             scene_state.setup_browse_mode = next_setup_browse_mode(scene_state.setup_browse_mode);
             scene_state.setup_room_label.clear();
             scene_state.setup_page = 0;
             scene_state.status = scene_state.setup_browse_mode == hadisplay::SetupBrowseMode::Rooms ? "ROOM VIEW" : "LIST VIEW";
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupCycleTypeFilter:
             scene_state.setup_type_filter = next_setup_type_filter(scene_state.setup_type_filter);
             scene_state.setup_page = 0;
             scene_state.status = "TYPE FILTER UPDATED";
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupPreviousPage:
             scene_state.setup_page = std::max(0, scene_state.setup_page - 1);
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupNextPage:
             ++scene_state.setup_page;
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupRefresh:
             if (!ha_client.configured()) {
                 scene_state.status = "CHECK CONFIG";
@@ -1594,7 +1674,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 scene_state.status = "SYNCING DEVICES";
             }
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::SetupSave: {
             config = config_from_scene(scene_state, config);
             std::string error;
@@ -1609,7 +1689,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 }
             }
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         }
         case hadisplay::ButtonId::DashboardToggleLight:
             if (action_button.value >= 0 && action_button.value < static_cast<int>(scene_state.entities.size())) {
@@ -1618,7 +1698,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 if (!ha_client.configured()) {
                     scene_state.status = "CHECK CONFIG";
                     needs_redraw = true;
-                    return false;
+                    return AppAction::None;
                 }
                 EntityActionRequest request{
                     .entity_id = entity.entity_id,
@@ -1641,7 +1721,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 }
                 needs_redraw = true;
             }
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DashboardOpenDetail:
             scene_state.detail_entity_index = action_button.value;
             scene_state.view_mode = hadisplay::ViewMode::Detail;
@@ -1660,21 +1740,21 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 scene_state.status = "DETAIL VIEW";
             }
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DashboardPreviousPage:
             scene_state.dashboard_page = std::max(0, scene_state.dashboard_page - 1);
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DashboardNextPage:
             ++scene_state.dashboard_page;
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DashboardConfigure:
             scene_state.view_mode = hadisplay::ViewMode::Setup;
             clear_detail_history(scene_state);
             scene_state.status = "SETUP VIEW";
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DashboardRefresh:
             if (!ha_client.configured()) {
                 scene_state.status = "CHECK CONFIG";
@@ -1683,13 +1763,33 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 scene_state.status = "SYNCING DEVICES";
             }
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DetailBack:
             scene_state.view_mode = hadisplay::ViewMode::Dashboard;
             clear_detail_history(scene_state);
             scene_state.status = "DASHBOARD";
             needs_redraw = true;
-            return false;
+            return AppAction::None;
+        case hadisplay::ButtonId::DebugLogScrollUp: {
+            const int page_size = hadisplay::debug_log_page_size(scene_state);
+            scene_state.debug_log_scroll = std::max(0, scene_state.debug_log_scroll - std::max(1, page_size - 1));
+            scene_state.status = "DEBUG LOG";
+            needs_redraw = true;
+            return AppAction::None;
+        }
+        case hadisplay::ButtonId::DebugLogScrollDown: {
+            const int page_size = hadisplay::debug_log_page_size(scene_state);
+            const int max_scroll = std::max(0, static_cast<int>(scene_state.debug_log_lines.size()) - page_size);
+            scene_state.debug_log_scroll = std::min(max_scroll,
+                                                    scene_state.debug_log_scroll + std::max(1, page_size - 1));
+            scene_state.status = "DEBUG LOG";
+            needs_redraw = true;
+            return AppAction::None;
+        }
+        case hadisplay::ButtonId::DebugLogClose:
+            restore_view_from_debug_log(scene_state);
+            needs_redraw = true;
+            return AppAction::None;
         case hadisplay::ButtonId::DetailToggleLight:
             if (scene_state.detail_entity_index >= 0 && scene_state.detail_entity_index < static_cast<int>(scene_state.entities.size())) {
                 const int entity_index = scene_state.detail_entity_index;
@@ -1697,7 +1797,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 if (!ha_client.configured()) {
                     scene_state.status = "CHECK CONFIG";
                     needs_redraw = true;
-                    return false;
+                    return AppAction::None;
                 }
                 const std::string busy_status = entity.kind == hadisplay::EntityKind::Climate ? "SETTING HEATING" : "TOGGLING DEVICE";
                 EntityActionRequest request{
@@ -1721,7 +1821,7 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 }
                 needs_redraw = true;
             }
-            return false;
+            return AppAction::None;
         case hadisplay::ButtonId::DetailBrightnessDown:
         case hadisplay::ButtonId::DetailBrightnessUp:
         case hadisplay::ButtonId::DetailSetRed:
@@ -1731,18 +1831,18 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
         case hadisplay::ButtonId::DetailSetNeutral:
         case hadisplay::ButtonId::DetailSetWarm: {
             if (action_button.value < 0 || action_button.value >= static_cast<int>(scene_state.entities.size())) {
-                return false;
+                return AppAction::None;
             }
 
             const int entity_index = action_button.value;
             const hadisplay::EntityItem& entity = scene_state.entities[static_cast<std::size_t>(entity_index)];
             if (entity.kind != hadisplay::EntityKind::Light) {
-                return false;
+                return AppAction::None;
             }
             if (!ha_client.configured()) {
                 scene_state.status = "CHECK CONFIG";
                 needs_redraw = true;
-                return false;
+                return AppAction::None;
             }
 
             auto clamp_kelvin = [&](int value) {
@@ -1792,16 +1892,16 @@ bool handle_button_action(hadisplay::SceneState& scene_state,
                 scene_state.status = "HA REQUEST ACTIVE";
             }
             needs_redraw = true;
-            return false;
+            return AppAction::None;
         }
         case hadisplay::ButtonId::Exit:
             scene_state.status = "EXITING TO NICKEL";
             force_full_refresh = true;
             needs_redraw = true;
-            return true;
+            return AppAction::ExitToNickel;
     }
 
-    return false;
+    return AppAction::None;
 }
 
 }  // namespace
@@ -1835,6 +1935,9 @@ int main() {
     hadisplay::SceneState scene_state{};
     scene_state.width = static_cast<int>(fb_state.view_width);
     scene_state.height = static_cast<int>(fb_state.view_height);
+    scene_state.compact_ui =
+        platform.family == hadisplay::KoboDeviceFamily::IMxEpdc &&
+        scene_state.width <= 800;
     scene_state.status = "STARTING";
     update_clock_status(scene_state);
 
@@ -1855,21 +1958,41 @@ int main() {
         std::cerr << "Color mode requested but FBInk reports no color panel; falling back to grayscale.\n";
     }
 
+    const std::string current_ssid = hadisplay::current_wifi_ssid();
+
     {
         std::ostringstream startup;
         startup << "Starting hadisplay: screen=" << scene_state.width << "x" << scene_state.height
                 << " display=" << (display_settings.effective_mode == hadisplay::DisplayMode::Color ? "color" : "grayscale")
                 << " entities=" << config.selected_entity_ids.size()
                 << " wifi=" << scene_state.wifi_label
-                << " battery=" << scene_state.battery_label
-                << " " << hadisplay::describe_device_platform(platform);
+                << " battery=" << scene_state.battery_label;
+        if (!current_ssid.empty()) {
+            startup << " ssid=\"" << current_ssid << "\"";
+        }
+        startup << " " << hadisplay::describe_device_platform(platform);
         hadisplay::log_info(startup.str());
     }
 
+    const hadisplay::ResolvedHaConfig resolved_ha = hadisplay::resolve_ha_config(config, current_ssid);
+    if (!resolved_ha.location_id.empty()) {
+        std::ostringstream message;
+        message << "Using HA location \"" << resolved_ha.location_id << "\"";
+        if (!resolved_ha.location_name.empty()) {
+            message << " (" << resolved_ha.location_name << ")";
+        }
+        if (!resolved_ha.match_reason.empty()) {
+            message << " via " << resolved_ha.match_reason;
+        }
+        hadisplay::log_info(message.str());
+    } else if (!resolved_ha.error.empty()) {
+        hadisplay::log_warn(resolved_ha.error);
+    }
+
     ha::Client ha_client({
-        .base_url = config.ha_url,
-        .token = config.ha_token,
-        .weather_entity_id = config.ha_weather_entity,
+        .base_url = resolved_ha.base_url,
+        .token = resolved_ha.token,
+        .weather_entity_id = resolved_ha.weather_entity_id,
     });
     AsyncState async_state;
     configure_async_mailbox(async_state);
@@ -1953,6 +2076,128 @@ int main() {
     auto next_light_refresh = now + kNormalLightPollInterval;
     auto next_device_refresh = now + kNormalDevicePollInterval;
     auto next_weather_refresh = now + kNormalWeatherPollInterval;
+
+    int exit_code = EXIT_SUCCESS;
+    auto process_pending_power_toggle = [&]() {
+        if (!(pending_power_toggle && input_devices.power_index >= 0)) {
+            return true;
+        }
+
+        pending_power_toggle = false;
+        pending_button.reset();
+        touch = {};
+        power_button_pressed = false;
+        scene_state.power_menu_open = false;
+        scene_state.pressed_button = -1;
+        scene_state.selected_button = -1;
+
+        if (power_state.state == PowerState::Sleeping) {
+            power_state.state = PowerState::Awake;
+            if (!render_resume_hint(fbfd, display_settings)) {
+                hadisplay::log_warn("Failed to render resume hint");
+            }
+            resume_runtime_services(platform, power_state, device_status);
+            refresh_input_grabs(input_devices);
+            apply_system_status(scene_state, device_status.snapshot());
+            update_clock_status(scene_state);
+            scene_state.status = "AWAKE";
+            force_full_refresh = true;
+            needs_redraw = true;
+            now = std::chrono::steady_clock::now();
+            next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
+            next_light_refresh = now + std::chrono::seconds(5);
+            next_device_refresh = now + std::chrono::seconds(2);
+            next_weather_refresh = now + std::chrono::seconds(5);
+            return true;
+        }
+
+        const hadisplay::SystemStatus sleep_status = device_status.snapshot();
+        apply_system_status(scene_state, sleep_status);
+        update_clock_status(scene_state);
+        save_dirty_config(config_store, scene_state, config, config_dirty);
+
+        pause_runtime_services(platform, power_state, device_status);
+        const bool will_kernel_suspend = kernel_suspend_supported(power_state, platform, sleep_status);
+        const bool show_kernel_sleep_hint =
+            will_kernel_suspend &&
+            platform.supports_hwtcon_powerdown_delay &&
+            !power_state.kernel_sleep_hint_blocked;
+
+        const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
+        if (!will_kernel_suspend && !render_sleep_screen(fbfd, display_settings, sleep_detail)) {
+            resume_runtime_services(platform, power_state, device_status);
+            return false;
+        }
+
+        if (will_kernel_suspend) {
+            if (show_kernel_sleep_hint) {
+                if (render_kernel_sleep_hint(fbfd, display_settings, sleep_detail)) {
+                    hadisplay::log_info("Rendered kernel sleep hint; waiting " +
+                                        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                           kKernelSleepHintSettleDelay)
+                                                           .count()) +
+                                        "ms before suspend");
+                    (void)wait_for_fbink_update_completion(fbfd, "kernel sleep hint");
+                    std::this_thread::sleep_for(kKernelSleepHintSettleDelay);
+                } else {
+                    hadisplay::log_warn("Kernel sleep hint render failed; continuing without it");
+                }
+            } else {
+                hadisplay::log_info("Skipping kernel sleep hint after earlier hwtcon suspend failure");
+            }
+            const SuspendResult suspend_result = suspend_to_ram(platform, fbfd);
+            if (suspend_result.ok) {
+                refresh_input_grabs(input_devices);
+                touch = {};
+                power_button_pressed = false;
+                if (!render_resume_hint(fbfd, display_settings)) {
+                    hadisplay::log_warn("Failed to render resume hint");
+                }
+                power_state.state = PowerState::Awake;
+                resume_runtime_services(platform, power_state, device_status);
+                drain_input_events(input_devices);
+                power_state.ignore_power_until = std::chrono::steady_clock::now() + kPostResumePowerIgnoreWindow;
+                apply_system_status(scene_state, device_status.snapshot());
+                update_clock_status(scene_state);
+                scene_state.status = "AWAKE";
+                force_full_refresh = true;
+                needs_redraw = true;
+                now = std::chrono::steady_clock::now();
+                next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
+                next_light_refresh = now + std::chrono::seconds(5);
+                next_device_refresh = now + std::chrono::seconds(2);
+                next_weather_refresh = now + std::chrono::seconds(5);
+            } else {
+                if (show_kernel_sleep_hint &&
+                    suspend_result.failure_reason.find("hwtcon") != std::string::npos) {
+                    power_state.kernel_sleep_hint_blocked = true;
+                    hadisplay::log_warn("Disabling kernel sleep hint for this session after hwtcon suspend failure");
+                }
+                if (!suspend_result.failure_reason.empty()) {
+                    power_state.kernel_suspend_blocked = true;
+                    power_state.kernel_suspend_block_reason = suspend_result.failure_reason;
+                    hadisplay::log_warn("Blocking further kernel suspend attempts: " +
+                                        power_state.kernel_suspend_block_reason);
+                }
+                if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
+                    hadisplay::log_warn("Failed to render sleep screen for software fallback");
+                }
+                power_state.state = PowerState::Sleeping;
+                scene_state.status = "SLEEPING";
+                needs_redraw = false;
+                force_full_refresh = false;
+                hadisplay::log_info("Entered software sleep mode after failed kernel suspend");
+            }
+        } else {
+            power_state.state = PowerState::Sleeping;
+            scene_state.status = "SLEEPING";
+            needs_redraw = false;
+            force_full_refresh = false;
+            hadisplay::log_info("Entered software sleep mode");
+        }
+
+        return true;
+    };
 
     while (g_running) {
         now = std::chrono::steady_clock::now();
@@ -2051,8 +2296,12 @@ int main() {
                                                               scene_state.height,
                                                               sx,
                                                               sy);
-                                const int released_on = hadisplay::button_at(buttons, sx, sy);
-                                if (scene_state.pressed_button >= 0 && scene_state.pressed_button == released_on) {
+                                const int released_on = hadisplay::button_at(scene_state, buttons, sx, sy);
+                                if (scene_state.power_menu_open && released_on < 0) {
+                                    scene_state.power_menu_open = false;
+                                    scene_state.selected_button = -1;
+                                    needs_redraw = true;
+                                } else if (scene_state.pressed_button >= 0 && scene_state.pressed_button == released_on) {
                                     pending_button = buttons[static_cast<std::size_t>(released_on)];
                                 }
                             }
@@ -2072,7 +2321,7 @@ int main() {
                                                           scene_state.height,
                                                           sx,
                                                           sy);
-                            const int pressed = hadisplay::button_at(buttons, sx, sy);
+                            const int pressed = hadisplay::button_at(scene_state, buttons, sx, sy);
                             if (pressed != scene_state.pressed_button) {
                                 scene_state.pressed_button = pressed;
                                 needs_redraw = true;
@@ -2088,121 +2337,8 @@ int main() {
             needs_redraw = true;
         }
 
-        if (pending_power_toggle && input_devices.power_index >= 0) {
-            pending_power_toggle = false;
-            pending_button.reset();
-            touch = {};
-            scene_state.pressed_button = -1;
-            scene_state.selected_button = -1;
-
-            if (power_state.state == PowerState::Sleeping) {
-                power_state.state = PowerState::Awake;
-                if (!render_resume_hint(fbfd, display_settings)) {
-                    hadisplay::log_warn("Failed to render resume hint");
-                }
-                resume_runtime_services(platform, power_state, device_status);
-                refresh_input_grabs(input_devices);
-                apply_system_status(scene_state, device_status.snapshot());
-                update_clock_status(scene_state);
-                scene_state.status = "AWAKE";
-                force_full_refresh = true;
-                needs_redraw = true;
-                now = std::chrono::steady_clock::now();
-                next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
-                next_light_refresh = now + std::chrono::seconds(5);
-                next_device_refresh = now + std::chrono::seconds(2);
-                next_weather_refresh = now + std::chrono::seconds(5);
-            } else {
-                const hadisplay::SystemStatus sleep_status = device_status.snapshot();
-                apply_system_status(scene_state, sleep_status);
-                update_clock_status(scene_state);
-                save_dirty_config(config_store, scene_state, config, config_dirty);
-
-                pause_runtime_services(platform, power_state);
-                const bool will_kernel_suspend = kernel_suspend_supported(power_state, platform, sleep_status);
-                const bool show_kernel_sleep_hint =
-                    will_kernel_suspend &&
-                    platform.supports_hwtcon_powerdown_delay &&
-                    !power_state.kernel_sleep_hint_blocked;
-
-                const std::string sleep_detail = sleep_status.battery_charging ? "Charging via USB" : "";
-                if (!will_kernel_suspend && !render_sleep_screen(fbfd, display_settings, sleep_detail)) {
-                    resume_runtime_services(platform, power_state, device_status);
-                    break;
-                }
-
-                if (will_kernel_suspend) {
-                    if (show_kernel_sleep_hint) {
-                        if (render_kernel_sleep_hint(fbfd, display_settings, sleep_detail)) {
-                            hadisplay::log_info("Rendered kernel sleep hint; waiting " +
-                                                std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                                   kKernelSleepHintSettleDelay)
-                                                                   .count()) +
-                                                "ms before suspend");
-                            (void)wait_for_fbink_update_completion(fbfd, "kernel sleep hint");
-                            std::this_thread::sleep_for(kKernelSleepHintSettleDelay);
-                        } else {
-                            hadisplay::log_warn("Kernel sleep hint render failed; continuing without it");
-                        }
-                    } else {
-                        hadisplay::log_info("Skipping kernel sleep hint after earlier hwtcon suspend failure");
-                    }
-                    const SuspendResult suspend_result = suspend_to_ram(platform, fbfd);
-                    if (suspend_result.ok) {
-                        refresh_input_grabs(input_devices);
-                        touch = {};
-                        power_button_pressed = false;
-                        if (!render_resume_hint(fbfd, display_settings)) {
-                            hadisplay::log_warn("Failed to render resume hint");
-                        }
-                        // Any wake from a successful kernel suspend is
-                        // legitimate — resume immediately.
-                        power_state.state = PowerState::Awake;
-                        resume_runtime_services(platform, power_state, device_status);
-                        // Drain any queued input events (the power button
-                        // press that woke the device from suspend) and set
-                        // an ignore window as a safety net.
-                        drain_input_events(input_devices);
-                        power_state.ignore_power_until = std::chrono::steady_clock::now() + kPostResumePowerIgnoreWindow;
-                        apply_system_status(scene_state, device_status.snapshot());
-                        update_clock_status(scene_state);
-                        scene_state.status = "AWAKE";
-                        force_full_refresh = true;
-                        needs_redraw = true;
-                        now = std::chrono::steady_clock::now();
-                        next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
-                        next_light_refresh = now + std::chrono::seconds(5);
-                        next_device_refresh = now + std::chrono::seconds(2);
-                        next_weather_refresh = now + std::chrono::seconds(5);
-                    } else {
-                        if (show_kernel_sleep_hint &&
-                            suspend_result.failure_reason.find("hwtcon") != std::string::npos) {
-                            power_state.kernel_sleep_hint_blocked = true;
-                            hadisplay::log_warn("Disabling kernel sleep hint for this session after hwtcon suspend failure");
-                        }
-                        if (!suspend_result.failure_reason.empty()) {
-                            power_state.kernel_suspend_blocked = true;
-                            power_state.kernel_suspend_block_reason = suspend_result.failure_reason;
-                            hadisplay::log_warn("Blocking further kernel suspend attempts: " +
-                                                power_state.kernel_suspend_block_reason);
-                        }
-                        if (!render_sleep_screen(fbfd, display_settings, sleep_detail)) {
-                            hadisplay::log_warn("Failed to render sleep screen for software fallback");
-                        }
-                        power_state.state = PowerState::Sleeping;
-                        scene_state.status = "SLEEPING";
-                        needs_redraw = false;
-                        force_full_refresh = false;
-                        hadisplay::log_info("Entered software sleep mode after failed kernel suspend");
-                    }
-                } else {
-                    power_state.state = PowerState::Sleeping;
-                    scene_state.status = "SLEEPING";
-                    needs_redraw = false;
-                    force_full_refresh = false;
-                    hadisplay::log_info("Entered software sleep mode");
-                }
-            }
+        if (!process_pending_power_toggle()) {
+            break;
         }
 
         if (power_state.state == PowerState::Awake) {
@@ -2251,23 +2387,30 @@ int main() {
 
         if (power_state.state == PowerState::Awake && pending_button.has_value()) {
             buttons = hadisplay::buttons_for(scene_state);
-            const bool should_exit = handle_button_action(scene_state,
-                                                          buttons,
-                                                          ha_client,
-                                                          device_status,
-                                                          config_store,
-                                                          config,
-                                                          async_state,
-                                                          config_dirty,
-                                                          *pending_button,
-                                                          needs_redraw,
-                                                          force_full_refresh);
+            const AppAction app_action = handle_button_action(scene_state,
+                                                              buttons,
+                                                              ha_client,
+                                                              device_status,
+                                                              config_store,
+                                                              config,
+                                                              async_state,
+                                                              config_dirty,
+                                                              *pending_button,
+                                                              needs_redraw,
+                                                              force_full_refresh);
             pending_button.reset();
             now = std::chrono::steady_clock::now();
             next_clock_refresh = scene_state.dev_mode ? now + kDevPollInterval : next_minute_deadline();
             next_light_refresh = now + (scene_state.dev_mode ? kDevPollInterval : kNormalLightPollInterval);
             next_device_refresh = now + (scene_state.dev_mode ? kDevPollInterval : kNormalDevicePollInterval);
             next_weather_refresh = now + (scene_state.dev_mode ? kDevPollInterval : kNormalWeatherPollInterval);
+
+            if (app_action == AppAction::Sleep) {
+                pending_power_toggle = true;
+                if (!process_pending_power_toggle()) {
+                    break;
+                }
+            }
 
             if (needs_redraw) {
                 buttons = hadisplay::buttons_for(scene_state);
@@ -2278,7 +2421,12 @@ int main() {
                 force_full_refresh = false;
             }
 
-            if (should_exit) {
+            if (app_action == AppAction::Shutdown) {
+                exit_code = kHadisplayExitShutdown;
+                break;
+            }
+
+            if (app_action == AppAction::ExitToNickel) {
                 break;
             }
         }
@@ -2293,12 +2441,16 @@ int main() {
         }
     }
 
-    hadisplay::log_info("Shutting down");
-    clear_screen(fbfd, true, display_settings);
+    hadisplay::log_info(exit_code == kHadisplayExitShutdown ? "Shutting down to poweroff" : "Shutting down");
+    // Preserve the last app frame when returning to Nickel so the Kobo UI
+    // doesn't inherit a forced black screen if Nickel repaints slowly.
+    if (exit_code == kHadisplayExitShutdown) {
+        clear_screen(fbfd, true, display_settings);
+    }
     close_input_devices(input_devices);
     close_async_mailbox(async_state);
     fbink_close(fbfd);
     std::cerr << "hadisplay exiting.\n";
     hadisplay::log_shutdown();
-    return EXIT_SUCCESS;
+    return exit_code;
 }

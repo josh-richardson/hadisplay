@@ -141,7 +141,7 @@ Examples:
 
 ## Home Assistant configuration
 
-Configuration lives in:
+Runtime configuration lives in:
 
 `/mnt/onboard/.adds/hadisplay/hadisplay-config.json`
 
@@ -149,9 +149,23 @@ Example:
 
 ```json
 {
-  "ha_url": "http://your-ha-instance:8123",
-  "ha_token": "your_long_lived_access_token",
-  "ha_weather_entity": "weather.forecast_home",
+  "default_location": "hackspace",
+  "locations": [
+    {
+      "id": "hackspace",
+      "name": "Hackspace",
+      "default": true,
+      "ha_url": "http://homeassistant:8123",
+      "ha_token": "your_hackspace_token"
+    },
+    {
+      "id": "home",
+      "name": "Home",
+      "match_ssids": ["My Home WiFi"],
+      "ha_url": "http://homeassistant.local:8123",
+      "ha_token": "your_home_token"
+    }
+  ],
   "display_mode": "auto",
   "hidden_entity_patterns": [
     "child lock",
@@ -172,20 +186,16 @@ Example:
 
 Behavior:
 
-- `ha_url`, `ha_token`, and `ha_weather_entity` are loaded at startup
+- Home Assistant config is resolved from `locations` first
+- `match_ssids` selects a location automatically from the current Wi-Fi SSID
+- `default_location` is used when no SSID match exists
+- legacy root-level `ha_url`, `ha_token`, and `ha_weather_entity` are still accepted for single-location configs
 - `display_mode` accepts `auto`, `grayscale`, or `color`
 - `hidden_entity_patterns` is a list of case-insensitive substrings to exclude from the setup device list
 - selected dashboard entities are persisted back into the same file
 - if no config exists, the app can enumerate Home Assistant entities and let the user select what should appear on the dashboard
 
-`.env` is still supported as a fallback:
-
-```text
-HA_URL=http://your-ha-instance:8123
-HA_TOKEN=your_long_lived_access_token
-```
-
-If `ha_url` or `ha_token` are missing from the JSON config, the app falls back to `.env`.
+For local development, prefer a repo-local `.hadisplay-config.json`, which is gitignored by default.
 
 ## Running on the Kobo
 

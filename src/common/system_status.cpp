@@ -505,6 +505,66 @@ struct DeviceStatus::Impl {
         }
         return ok;
     }
+
+    struct SavedBrightness {
+        std::filesystem::path path;
+        std::string value;
+    };
+    std::vector<SavedBrightness> saved_brightness;
+    bool brightness_saved = false;
+
+    void save_and_disable_all_brightness() {
+        saved_brightness.clear();
+        brightness_saved = false;
+
+        // Read ALL backlight channels first, then zero them.  Reading and
+        // zeroing in a single pass can cascade: writing 0 to the master
+        // device (lm3630a_led) may reset sub-channels (lm3630a_leda/b)
+        // before we read them.
+        const std::filesystem::path root("/sys/class/backlight");
+        if (!path_is_directory(root)) {
+            return;
+        }
+
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(root, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            const auto brightness_path = it->path() / "brightness";
+            if (!path_exists(brightness_path)) {
+                continue;
+            }
+            const std::string current = read_trimmed(brightness_path);
+            if (!current.empty()) {
+                saved_brightness.push_back({brightness_path, current});
+                log_info("Backlight save: " + it->path().filename().string() + " = " + current);
+            }
+        }
+
+        // Now zero all channels.
+        for (const auto& entry : saved_brightness) {
+            write_string(entry.path, "0");
+        }
+        brightness_saved = true;
+    }
+
+    void restore_all_brightness() {
+        if (!brightness_saved) {
+            return;
+        }
+        // After kernel suspend the backlight controller may come up in an
+        // undefined power state (bl_power != 0).  Reset bl_power to
+        // FB_BLANK_UNBLANK (0) before writing brightness so the value
+        // actually takes effect.
+        for (const auto& entry : saved_brightness) {
+            const auto bl_power_path = entry.path.parent_path() / "bl_power";
+            if (path_exists(bl_power_path)) {
+                write_string(bl_power_path, "0");
+            }
+            write_string(entry.path, entry.value);
+            log_info("Backlight restore: " + entry.path.parent_path().filename().string() + " = " + entry.value);
+        }
+        saved_brightness.clear();
+        brightness_saved = false;
+    }
 };
 
 SystemStatus DeviceStatus::snapshot() {
@@ -558,6 +618,20 @@ bool DeviceStatus::cycle_brightness(SystemStatus& out_status) {
         out_status.brightness_label = make_brightness_label(next_percent);
     }
     return ok;
+}
+
+void DeviceStatus::save_and_disable_brightness() {
+    if (impl_ == nullptr) {
+        impl_ = new Impl();
+    }
+    impl_->save_and_disable_all_brightness();
+}
+
+void DeviceStatus::restore_brightness() {
+    if (impl_ == nullptr) {
+        return;
+    }
+    impl_->restore_all_brightness();
 }
 
 void DeviceStatus::try_wifi_recovery() {

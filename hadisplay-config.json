@@ -1,4 +1,5 @@
 {
+  "default_location": "hackspace",
   "display_mode": "auto",
   "hidden_entity_patterns": [
     "child lock",
@@ -8,6 +9,24 @@
     "lock child",
     "parental lock",
     "button lock"
+  ],
+  "locations": [
+    {
+      "default": true,
+      "ha_token": "your_hackspace_token",
+      "ha_url": "http://homeassistant:8123",
+      "id": "hackspace",
+      "name": "Hackspace"
+    },
+    {
+      "ha_token": "your_home_token",
+      "ha_url": "http://homeassistant.local:8123",
+      "id": "home",
+      "match_ssids": [
+        "My Home WiFi"
+      ],
+      "name": "Home"
+    }
   ],
   "selected_entity_ids": []
 }

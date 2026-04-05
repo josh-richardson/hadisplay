@@ -20,6 +20,11 @@ void draw_wrench_icon(RenderBuffer& buffer,
                       int height,
                       const Rect& rect,
                       Color value);
+void draw_power_icon(RenderBuffer& buffer,
+                     int width,
+                     int height,
+                     const Rect& rect,
+                     Color value);
 void draw_cog_icon(RenderBuffer& buffer,
                    int width,
                    int height,

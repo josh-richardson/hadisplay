@@ -6,18 +6,14 @@
 #include <curl/curl.h>
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <map>
 #include <sstream>
 #include <string_view>
-#include <unistd.h>
 
 namespace ha {
 namespace {
@@ -49,85 +45,6 @@ std::string trim(std::string value) {
     }
     const auto end = value.find_last_not_of(" \t\r\n");
     return value.substr(begin, end - begin + 1);
-}
-
-std::filesystem::path executable_dir() {
-    std::array<char, 4096> buffer{};
-    const ssize_t size = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
-    if (size <= 0) {
-        return {};
-    }
-    buffer[static_cast<std::size_t>(size)] = '\0';
-    return std::filesystem::path(buffer.data()).parent_path();
-}
-
-std::filesystem::path find_env_file() {
-    if (const char* override_path = std::getenv("HADISPLAY_ENV_FILE")) {
-        return std::filesystem::path(override_path);
-    }
-
-    std::array<std::filesystem::path, 6> candidates{
-        std::filesystem::current_path() / ".env",
-        std::filesystem::current_path().parent_path() / ".env",
-        executable_dir() / ".env",
-        executable_dir().parent_path() / ".env",
-        executable_dir().parent_path().parent_path() / ".env",
-        executable_dir().parent_path().parent_path().parent_path() / ".env",
-    };
-
-    for (const auto& candidate : candidates) {
-        if (!candidate.empty() && std::filesystem::exists(candidate)) {
-            return candidate;
-        }
-    }
-
-    return {};
-}
-
-bool parse_env_file(const std::filesystem::path& path,
-                    std::string& base_url,
-                    std::string& token,
-                    std::string& weather_entity,
-                    std::string& error) {
-    std::ifstream input(path);
-    if (!input) {
-        error = "Unable to open " + path.string() + ": " + std::strerror(errno);
-        return false;
-    }
-
-    std::string line;
-    while (std::getline(input, line)) {
-        line = trim(line);
-        if (line.empty() || line.starts_with('#')) {
-            continue;
-        }
-
-        const auto equals = line.find('=');
-        if (equals == std::string::npos) {
-            continue;
-        }
-
-        const std::string key = trim(line.substr(0, equals));
-        const std::string value = trim(line.substr(equals + 1));
-        if (key == "HA_URL") {
-            base_url = value;
-        } else if (key == "HA_TOKEN") {
-            token = value;
-        } else if (key == "HA_WEATHER_ENTITY") {
-            weather_entity = value;
-        }
-    }
-
-    if (base_url.empty() || token.empty()) {
-        error = "Missing HA_URL or HA_TOKEN in " + path.string();
-        return false;
-    }
-
-    while (!base_url.empty() && base_url.back() == '/') {
-        base_url.pop_back();
-    }
-
-    return true;
 }
 
 void normalize_base_url(std::string& base_url) {
@@ -654,28 +571,9 @@ Client::Client(ClientConfig config) {
     token_ = std::move(config.token);
     weather_entity_id_ = std::move(config.weather_entity_id);
 
-    std::string env_base_url;
-    std::string env_token;
-    std::string env_weather_entity;
-    std::string env_error;
-    const auto env_path = find_env_file();
-    if (!env_path.empty()) {
-        parse_env_file(env_path, env_base_url, env_token, env_weather_entity, env_error);
-    }
-
-    if (base_url_.empty()) {
-        base_url_ = std::move(env_base_url);
-    }
-    if (token_.empty()) {
-        token_ = std::move(env_token);
-    }
-    if (weather_entity_id_.empty()) {
-        weather_entity_id_ = std::move(env_weather_entity);
-    }
-
     normalize_base_url(base_url_);
     if (base_url_.empty() || token_.empty()) {
-        configuration_error_ = "Missing HA URL or token in config/.env";
+        configuration_error_ = "Missing HA URL or token in config JSON";
     }
 }
 

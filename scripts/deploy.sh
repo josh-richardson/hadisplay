@@ -8,6 +8,27 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 . "${SCRIPT_DIR}/hadisplay-target.sh"
 
 TARGET_NAME="${HADISPLAY_TARGET:-${HADISPLAY_DEFAULT_TARGET:-clara-colour}}"
+SYNC_CONFIG=false
+
+resolve_config_file() {
+    if [ -n "${HADISPLAY_CONFIG_FILE:-}" ] && [ -f "${HADISPLAY_CONFIG_FILE}" ]; then
+        printf '%s\n' "${HADISPLAY_CONFIG_FILE}"
+        return 0
+    fi
+
+    for candidate in \
+        "${PROJECT_DIR}/.hadisplay-config.json" \
+        "${PROJECT_DIR}/hadisplay-config.json"
+    do
+        if [ -f "${candidate}" ]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -t|--target)
@@ -22,6 +43,10 @@ while [ $# -gt 0 ]; do
             TARGET_NAME="${1#*=}"
             shift
             ;;
+        --sync-config)
+            SYNC_CONFIG=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
@@ -33,6 +58,12 @@ hadisplay_load_target "${TARGET_NAME}" || exit 1
 
 REMOTE="${HADISPLAY_SSH_HOST}"
 REMOTE_DIR="${HADISPLAY_REMOTE_DIR}"
+LOCAL_CONFIG=""
+if LOCAL_CONFIG="$(resolve_config_file)"; then
+    :
+else
+    LOCAL_CONFIG=""
+fi
 
 detect_jobs() {
     if command -v nproc >/dev/null 2>&1; then
@@ -90,13 +121,26 @@ rsync -rtvP --inplace --no-perms --no-owner --no-group \
     --rsync-path=/usr/bin/rsync -e ssh \
     "${PROJECT_DIR}/targets/${HADISPLAY_TARGET_NAME}.env" \
     "${REMOTE}:${REMOTE_DIR}/target.env"
-if [ -f "${PROJECT_DIR}/.env" ]; then
-    rsync -rtvP --inplace --no-perms --no-owner --no-group \
-        --rsync-path=/usr/bin/rsync -e ssh \
-        "${PROJECT_DIR}/.env" \
-        "${REMOTE}:${REMOTE_DIR}/.env"
+if [ -n "${LOCAL_CONFIG}" ]; then
+    REMOTE_CONFIG_PATH="${REMOTE_DIR}/hadisplay-config.json"
+    if [ "${SYNC_CONFIG}" = true ]; then
+        SHOULD_SYNC_CONFIG=true
+    elif ssh "${REMOTE}" "[ -f ${REMOTE_CONFIG_PATH} ]"; then
+        SHOULD_SYNC_CONFIG=false
+    else
+        SHOULD_SYNC_CONFIG=true
+    fi
+
+    if [ "${SHOULD_SYNC_CONFIG}" = true ]; then
+        rsync -rtvP --inplace --no-perms --no-owner --no-group \
+            --rsync-path=/usr/bin/rsync -e ssh \
+            "${LOCAL_CONFIG}" \
+            "${REMOTE}:${REMOTE_CONFIG_PATH}"
+    else
+        echo "Remote config already exists; skipping config sync. Pass --sync-config to replace it."
+    fi
 else
-    echo "No .env found at ${PROJECT_DIR}/.env; skipping."
+    echo "No local hadisplay config found; skipping config sync."
 fi
 
 # Restart on device.

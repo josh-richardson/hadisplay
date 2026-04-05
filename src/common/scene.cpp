@@ -38,6 +38,18 @@ bool weather_is_sunny(const std::string& condition) {
            condition.find("clear") != std::string::npos;
 }
 
+bool use_compact_text_layout(const SceneState& state) {
+    return state.compact_ui;
+}
+
+int preferred_scale_for(const SceneState& state, int normal_scale, int compact_scale) {
+    return use_compact_text_layout(state) ? compact_scale : normal_scale;
+}
+
+int debug_log_line_scale(const SceneState& state) {
+    return state.compact_ui ? 1 : 2;
+}
+
 int selected_entity_count(const SceneState& state) {
     return static_cast<int>(std::count_if(state.entities.begin(), state.entities.end(), [](const EntityItem& entity) {
         return entity.selected;
@@ -223,6 +235,32 @@ Rect climate_info_row_rect(const scene::SceneLayout& layout, int index) {
     };
 }
 
+Rect power_menu_rect(const scene::SceneLayout& layout, const SceneState& state) {
+    const int width = state.compact_ui ? 188 : 224;
+    const int row_height = state.compact_ui ? 38 : 44;
+    const int padding = 8;
+    const int gap = 8;
+    constexpr int kPowerMenuItems = 4;
+    return {
+        layout.power_button.x + layout.power_button.width - width,
+        layout.system_bar.y + layout.system_bar.height + 8,
+        width,
+        (padding * 2) + (row_height * kPowerMenuItems) + (gap * (kPowerMenuItems - 1)),
+    };
+}
+
+Rect power_menu_item_rect(const Rect& menu, const SceneState& state, int index) {
+    const int padding = 8;
+    const int gap = 8;
+    const int row_height = state.compact_ui ? 38 : 44;
+    return {
+        menu.x + padding,
+        menu.y + padding + (index * (row_height + gap)),
+        menu.width - (padding * 2),
+        row_height,
+    };
+}
+
 const Button* find_button(const std::vector<Button>& buttons, ButtonId id, int value, int* index_out = nullptr) {
     for (std::size_t i = 0; i < buttons.size(); ++i) {
         if (buttons[i].id == id && buttons[i].value == value) {
@@ -290,15 +328,29 @@ void draw_text_button(RenderBuffer& buffer,
     } else if (selected) {
         fill = buffer.format == PixelFormat::RGBA32 ? scene::active_theme().highlight : kLight;
     }
+    int resolved_scale = scale;
+    while (resolved_scale > 1) {
+        const int horizontal_padding = std::max(8, resolved_scale * 4);
+        const int vertical_padding = std::max(8, resolved_scale * 2);
+        const int available_width = std::max(0, rect.width - horizontal_padding);
+        const int available_height = std::max(0, rect.height - vertical_padding);
+        if (scene::text_width(upper, resolved_scale) <= available_width &&
+            (7 * resolved_scale) <= available_height) {
+            break;
+        }
+        --resolved_scale;
+    }
+    const int horizontal_padding = std::max(8, resolved_scale * 4);
+    const std::string fitted_label = scene::fit_text_to_width(upper, resolved_scale, rect.width - horizontal_padding);
     scene::fill_rect(buffer, width, height, rect, fill);
     scene::draw_rect_thick(buffer, width, height, rect, 2, kDark);
     scene::draw_text_centered(buffer,
                               width,
                               height,
                               rect,
-                              rect.y + ((rect.height - (7 * scale)) / 2),
-                              upper,
-                              scale,
+                              rect.y + ((rect.height - (7 * resolved_scale)) / 2),
+                              fitted_label,
+                              resolved_scale,
                               text_color);
 }
 
@@ -353,7 +405,13 @@ void draw_top_bar(RenderBuffer& buffer,
                   const SceneState& state,
                   const scene::SceneLayout& layout,
                   bool brightness_pressed,
-                  bool dev_pressed) {
+                  bool dev_pressed,
+                  bool power_pressed) {
+    const bool compact_ui = use_compact_text_layout(state);
+    const int clock_scale = preferred_scale_for(state, 4, 3);
+    const int date_scale = 2;
+    const int weather_scale = 2;
+    const int brightness_scale = preferred_scale_for(state, 3, 2);
     scene::fill_rect(buffer, state.width, state.height, layout.system_bar, kDark);
     scene::draw_line(buffer,
                      state.width,
@@ -369,17 +427,17 @@ void draw_top_bar(RenderBuffer& buffer,
                      state.width,
                      state.height,
                      layout.clock_rect.x,
-                     layout.system_bar.y + 14,
-                     scene::fit_text_to_width(scene::uppercase_ascii(state.time_label), 4, layout.clock_rect.width),
-                     4,
+                     layout.system_bar.y + (compact_ui ? 10 : 14),
+                     scene::fit_text_to_width(scene::uppercase_ascii(state.time_label), clock_scale, layout.clock_rect.width),
+                     clock_scale,
                      kWhite);
     scene::draw_text(buffer,
                      state.width,
                      state.height,
                      layout.clock_rect.x,
-                     layout.system_bar.y + 56,
-                     scene::fit_text_to_width(scene::uppercase_ascii(state.date_label), 2, layout.clock_rect.width),
-                     2,
+                     layout.system_bar.y + (compact_ui ? 40 : 56),
+                     scene::fit_text_to_width(scene::uppercase_ascii(state.date_label), date_scale, layout.clock_rect.width),
+                     date_scale,
                      kLight);
 
     if (state.weather_available) {
@@ -387,13 +445,19 @@ void draw_top_bar(RenderBuffer& buffer,
             scene::draw_sun_icon(buffer,
                                  state.width,
                                  state.height,
-                                 {layout.weather_rect.x + 4, layout.weather_rect.y - 28, 72, layout.weather_rect.height + 18},
+                                 {layout.weather_rect.x + 4,
+                                  layout.weather_rect.y - (compact_ui ? 16 : 28),
+                                  compact_ui ? 54 : 72,
+                                  layout.weather_rect.height + (compact_ui ? 8 : 18)},
                                  buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_yellow : kWhite);
         } else {
             scene::draw_cloud_icon(buffer,
                                    state.width,
                                    state.height,
-                                   {layout.weather_rect.x - 2, layout.weather_rect.y - 4, 104, layout.weather_rect.height + 26},
+                                   {layout.weather_rect.x - (compact_ui ? 4 : 2),
+                                    layout.weather_rect.y - (compact_ui ? 12 : 4),
+                                    compact_ui ? 84 : 104,
+                                    layout.weather_rect.height + (compact_ui ? 16 : 26)},
                                    weather_is_rainy(state.weather_condition),
                                    buffer.format == PixelFormat::RGBA32 ? scene::active_theme().accent_blue : kWhite,
                                    kLight);
@@ -402,10 +466,12 @@ void draw_top_bar(RenderBuffer& buffer,
     scene::draw_text(buffer,
                      state.width,
                      state.height,
-                     layout.weather_rect.x + 108,
-                     layout.weather_rect.y + 18,
-                     scene::fit_text_to_width(scene::uppercase_ascii(state.weather_range_label), 2, layout.weather_rect.width - 112),
-                     2,
+                     layout.weather_rect.x + (compact_ui ? 84 : 108),
+                     layout.weather_rect.y + (compact_ui ? 10 : 18),
+                     scene::fit_text_to_width(scene::uppercase_ascii(state.weather_range_label),
+                                              weather_scale,
+                                              layout.weather_rect.width - (compact_ui ? 88 : 112)),
+                     weather_scale,
                      kWhite);
 
     scene::draw_status_chip(buffer,
@@ -426,10 +492,25 @@ void draw_top_bar(RenderBuffer& buffer,
                                layout.brightness_button.y,
                                layout.brightness_button.width - 46,
                                layout.brightness_button.height},
-                              layout.brightness_button.y + ((layout.brightness_button.height - 21) / 2),
+                              layout.brightness_button.y + ((layout.brightness_button.height - (7 * brightness_scale)) / 2),
                               state.brightness_available ? state.brightness_label : "--",
-                              3,
+                              brightness_scale,
                               kDark);
+
+    scene::draw_status_chip(buffer,
+                            state.width,
+                            state.height,
+                            layout.power_button,
+                            kWhite,
+                            (power_pressed || state.power_menu_open) ? kMid : kWhite);
+    scene::draw_power_icon(buffer,
+                           state.width,
+                           state.height,
+                           {layout.power_button.x + 6,
+                            layout.power_button.y + 6,
+                            layout.power_button.width - 12,
+                            layout.power_button.height - 12},
+                           kDark);
 
     if (state.dev_mode || dev_pressed) {
         scene::fill_rect(buffer, state.width, state.height, layout.dev_button, dev_pressed ? kLight : kWhite);
@@ -461,6 +542,115 @@ void draw_top_bar(RenderBuffer& buffer,
                              state.battery_available,
                              buffer.format == PixelFormat::RGBA32 && state.battery_charging ? scene::active_theme().accent_green : kWhite,
                              kMid);
+}
+
+void draw_power_menu(RenderBuffer& buffer,
+                     const SceneState& state,
+                     const Rect& menu,
+                     const std::vector<Button>& buttons) {
+    scene::fill_rect(buffer, state.width, state.height, menu, kWhite);
+    scene::draw_rect_thick(buffer, state.width, state.height, menu, 2, kDark);
+
+    for (std::size_t i = 0; i < buttons.size(); ++i) {
+        const ButtonId id = buttons[i].id;
+        if (id != ButtonId::PowerMenuDebugLog &&
+            id != ButtonId::PowerMenuSleep &&
+            id != ButtonId::PowerMenuExit &&
+            id != ButtonId::PowerMenuShutdown) {
+            continue;
+        }
+
+        draw_text_button(buffer,
+                         state.width,
+                         state.height,
+                         buttons[i].rect,
+                         buttons[i].label,
+                         static_cast<int>(i) == state.pressed_button,
+                         static_cast<int>(i) == state.selected_button,
+                         state.compact_ui ? 2 : 3);
+    }
+}
+
+std::string debug_log_range_label(const SceneState& state, int page_size) {
+    if (state.debug_log_lines.empty()) {
+        return "EMPTY";
+    }
+    const int start = std::clamp(state.debug_log_scroll, 0, std::max(0, static_cast<int>(state.debug_log_lines.size()) - 1));
+    const int end = std::min(static_cast<int>(state.debug_log_lines.size()), start + std::max(1, page_size));
+    std::ostringstream label;
+    label << (start + 1) << "-" << end << "/" << state.debug_log_lines.size();
+    if (state.debug_log_truncated) {
+        label << " TAIL";
+    }
+    return label.str();
+}
+
+void draw_debug_log_view(RenderBuffer& buffer,
+                         const SceneState& state,
+                         const scene::SceneLayout& layout) {
+    const int line_scale = debug_log_line_scale(state);
+    const int line_height = (7 * line_scale) + (state.compact_ui ? 4 : 6);
+    const Rect log_panel{
+        layout.body.x,
+        layout.body.y,
+        layout.body.width,
+        layout.body.height,
+    };
+    const Rect text_bounds{
+        log_panel.x + 16,
+        log_panel.y + 14,
+        log_panel.width - 32,
+        log_panel.height - 28,
+    };
+    const int page_size = debug_log_page_size(state);
+
+    draw_header(buffer,
+                state.width,
+                state.height,
+                layout,
+                "DEBUG LOG",
+                "HADISPLAY.LOG",
+                debug_log_range_label(state, page_size));
+
+    scene::fill_rect(buffer, state.width, state.height, log_panel, kWhite);
+    scene::draw_rect_thick(buffer, state.width, state.height, log_panel, 2, kDark);
+
+    if (state.debug_log_lines.empty()) {
+        scene::draw_text_centered(buffer,
+                                  state.width,
+                                  state.height,
+                                  log_panel,
+                                  log_panel.y + (log_panel.height / 2) - 20,
+                                  "LOG FILE EMPTY",
+                                  3,
+                                  kDark);
+        scene::draw_text_centered(buffer,
+                                  state.width,
+                                  state.height,
+                                  log_panel,
+                                  log_panel.y + (log_panel.height / 2) + 18,
+                                  "OPEN HADISPLAY TO GENERATE LOGS",
+                                  2,
+                                  kMid);
+        return;
+    }
+
+    const int max_scroll = std::max(0, static_cast<int>(state.debug_log_lines.size()) - page_size);
+    const int start = std::clamp(state.debug_log_scroll, 0, max_scroll);
+    const int count = std::min(page_size, static_cast<int>(state.debug_log_lines.size()) - start);
+    for (int i = 0; i < count; ++i) {
+        const std::string fitted = scene::fit_text_to_width(state.debug_log_lines[static_cast<std::size_t>(start + i)],
+                                                            line_scale,
+                                                            text_bounds.width);
+        scene::draw_text(buffer,
+                         state.width,
+                         state.height,
+                         text_bounds.x,
+                         text_bounds.y + (i * line_height),
+                         fitted,
+                         line_scale,
+                         kDark);
+    }
 }
 
 std::string setup_summary(const EntityItem& entity) {
@@ -1229,6 +1419,11 @@ void draw_footer_buttons(RenderBuffer& buffer,
         switch (buttons[i].id) {
             case ButtonId::BrightnessToggle:
             case ButtonId::DevModeToggle:
+            case ButtonId::PowerMenuToggle:
+            case ButtonId::PowerMenuDebugLog:
+            case ButtonId::PowerMenuSleep:
+            case ButtonId::PowerMenuExit:
+            case ButtonId::PowerMenuShutdown:
             case ButtonId::SetupToggleLight:
             case ButtonId::SetupOpenRoom:
             case ButtonId::DashboardToggleLight:
@@ -1261,11 +1456,20 @@ void draw_footer_buttons(RenderBuffer& buffer,
 }  // namespace
 
 std::vector<Button> buttons_for(const SceneState& state) {
-    const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height);
+    const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height, state.compact_ui);
     std::vector<Button> buttons{
         {.id = ButtonId::BrightnessToggle, .label = "BRIGHTNESS", .rect = layout.brightness_button},
         {.id = ButtonId::DevModeToggle, .label = "DEV", .rect = layout.dev_button},
+        {.id = ButtonId::PowerMenuToggle, .label = "POWER", .rect = layout.power_button},
     };
+
+    if (state.power_menu_open) {
+        const Rect menu = power_menu_rect(layout, state);
+        buttons.push_back({.id = ButtonId::PowerMenuDebugLog, .label = "DEBUG LOG", .rect = power_menu_item_rect(menu, state, 0)});
+        buttons.push_back({.id = ButtonId::PowerMenuSleep, .label = "SLEEP", .rect = power_menu_item_rect(menu, state, 1)});
+        buttons.push_back({.id = ButtonId::PowerMenuExit, .label = "EXIT TO GUI", .rect = power_menu_item_rect(menu, state, 2)});
+        buttons.push_back({.id = ButtonId::PowerMenuShutdown, .label = "SHUT DOWN", .rect = power_menu_item_rect(menu, state, 3)});
+    }
 
     if (state.view_mode == ViewMode::Setup) {
         const bool room_list_view = state.setup_browse_mode == SetupBrowseMode::Rooms && state.setup_room_label.empty();
@@ -1318,6 +1522,7 @@ std::vector<Button> buttons_for(const SceneState& state) {
         const int page = std::clamp(state.dashboard_page, 0, max_page_index(static_cast<int>(selected.size()), kDashboardPageSize));
         const int start = page * kDashboardPageSize;
         const int count = std::min(kDashboardPageSize, static_cast<int>(selected.size()) - start);
+        const int footer_count = 4;
         const int gutter = 18;
         for (int i = 0; i < count; ++i) {
             const int entity_index = selected[static_cast<std::size_t>(start + i)];
@@ -1347,11 +1552,17 @@ std::vector<Button> buttons_for(const SceneState& state) {
                 .value = entity_index,
             });
         }
-        buttons.push_back({.id = ButtonId::DashboardConfigure, .label = "SETUP", .rect = footer_button_rect(layout, 5, 0)});
-        buttons.push_back({.id = ButtonId::DashboardRefresh, .label = "REFRESH", .rect = footer_button_rect(layout, 5, 1)});
-        buttons.push_back({.id = ButtonId::DashboardPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, 5, 2)});
-        buttons.push_back({.id = ButtonId::DashboardNextPage, .label = "NEXT", .rect = footer_button_rect(layout, 5, 3)});
-        buttons.push_back({.id = ButtonId::Exit, .label = "EXIT", .rect = footer_button_rect(layout, 5, 4)});
+        buttons.push_back({.id = ButtonId::DashboardConfigure, .label = "SETUP", .rect = footer_button_rect(layout, footer_count, 0)});
+        buttons.push_back({.id = ButtonId::DashboardRefresh, .label = "REFRESH", .rect = footer_button_rect(layout, footer_count, 1)});
+        buttons.push_back({.id = ButtonId::DashboardPreviousPage, .label = "PREV", .rect = footer_button_rect(layout, footer_count, 2)});
+        buttons.push_back({.id = ButtonId::DashboardNextPage, .label = "NEXT", .rect = footer_button_rect(layout, footer_count, 3)});
+        return buttons;
+    }
+
+    if (state.view_mode == ViewMode::DebugLog) {
+        buttons.push_back({.id = ButtonId::DebugLogScrollUp, .label = "UP", .rect = footer_button_rect(layout, 3, 0)});
+        buttons.push_back({.id = ButtonId::DebugLogScrollDown, .label = "DOWN", .rect = footer_button_rect(layout, 3, 1)});
+        buttons.push_back({.id = ButtonId::DebugLogClose, .label = "CLOSE", .rect = footer_button_rect(layout, 3, 2)});
         return buttons;
     }
 
@@ -1401,13 +1612,24 @@ std::vector<Button> buttons_for(const SceneState& state) {
         }
     }
 
-    buttons.push_back({.id = ButtonId::DetailBack, .label = "BACK", .rect = footer_button_rect(layout, 2, 0)});
-    buttons.push_back({.id = ButtonId::Exit, .label = "EXIT", .rect = footer_button_rect(layout, 2, 1)});
+    buttons.push_back({.id = ButtonId::DetailBack, .label = "BACK", .rect = footer_button_rect(layout, 1, 0)});
     return buttons;
 }
 
-int button_at(const std::vector<Button>& buttons, int x, int y) {
+int button_at(const SceneState& state, const std::vector<Button>& buttons, int x, int y) {
     for (std::size_t i = 0; i < buttons.size(); ++i) {
+        if (state.power_menu_open) {
+            switch (buttons[i].id) {
+                case ButtonId::PowerMenuToggle:
+                case ButtonId::PowerMenuDebugLog:
+                case ButtonId::PowerMenuSleep:
+                case ButtonId::PowerMenuExit:
+                case ButtonId::PowerMenuShutdown:
+                    break;
+                default:
+                    continue;
+            }
+        }
         if (scene::contains(buttons[i].rect, x, y)) {
             return static_cast<int>(i);
         }
@@ -1418,17 +1640,20 @@ int button_at(const std::vector<Button>& buttons, int x, int y) {
 RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& buttons, PixelFormat pixel_format) {
     scene::set_active_theme(scene::theme_for(pixel_format));
     RenderBuffer buffer = scene::make_render_buffer(state.width, state.height, pixel_format, kWhite);
-    const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height);
+    const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height, state.compact_ui);
 
     int brightness_button_index = -1;
     int dev_button_index = -1;
+    int power_button_index = -1;
     find_button(buttons, ButtonId::BrightnessToggle, -1, &brightness_button_index);
     find_button(buttons, ButtonId::DevModeToggle, -1, &dev_button_index);
+    find_button(buttons, ButtonId::PowerMenuToggle, -1, &power_button_index);
     draw_top_bar(buffer,
                  state,
                  layout,
                  brightness_button_index == state.pressed_button,
-                 dev_button_index == state.pressed_button);
+                 dev_button_index == state.pressed_button,
+                 power_button_index == state.pressed_button);
 
     scene::fill_rect(buffer, state.width, state.height, layout.outer, kWhite);
     scene::draw_rect_thick(buffer, state.width, state.height, layout.outer, 2, kDark);
@@ -1443,10 +1668,24 @@ RenderBuffer render_scene(const SceneState& state, const std::vector<Button>& bu
         case ViewMode::Detail:
             draw_detail_view(buffer, state, layout, buttons);
             break;
+        case ViewMode::DebugLog:
+            draw_debug_log_view(buffer, state, layout);
+            break;
     }
 
     draw_footer_buttons(buffer, state, buttons);
+    if (state.power_menu_open) {
+        draw_power_menu(buffer, state, power_menu_rect(layout, state), buttons);
+    }
     return buffer;
+}
+
+int debug_log_page_size(const SceneState& state) {
+    const scene::SceneLayout layout = scene::make_scene_layout(state.width, state.height, state.compact_ui);
+    const int line_scale = debug_log_line_scale(state);
+    const int line_height = (7 * line_scale) + (state.compact_ui ? 4 : 6);
+    const int available_height = std::max(0, layout.body.height - 28);
+    return std::max(1, available_height / std::max(1, line_height));
 }
 
 }  // namespace hadisplay
