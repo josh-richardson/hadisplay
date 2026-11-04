@@ -7,6 +7,9 @@ It runs as a standalone app on the Kobo, takes over the screen while active, and
 ## Status
 
 - Tested on the **Kobo Clara Colour N367B** and an **i.MX6 / Nia-class Kobo on `ssh hackspace-kobo`**.
+- Also verified on the **Kobo Libra Colour N428** (device code 390, "Monza", Mark 13 / MediaTek
+  MT8110, firmware 4.46.23836) via `targets/libra-colour.env`. No source changes were needed:
+  the existing `mediatek-hwtcon` family and `wlan_drv_gen4m` teardown both worked as-is.
 - Device support is now target-driven. Clara Colour remains the default target when no target is specified.
 - Device-specific runtime assumptions live in `targets/*.env` instead of being hardcoded into the shell entrypoints.
 
