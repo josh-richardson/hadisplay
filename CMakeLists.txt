@@ -74,7 +74,11 @@ if(HADISPLAY_NEEDS_FBINK)
     ExternalProject_Add(fbink_external
         GIT_REPOSITORY https://github.com/NiLuJe/FBInk.git
         GIT_TAG "${HADISPLAY_FBINK_GIT_TAG}"
-        GIT_SHALLOW TRUE
+        # GIT_SHALLOW does a depth-1 clone of the default branch, which cannot reach the
+        # pinned commit: the download step fails with "fatal: unable to read tree <sha>"
+        # followed by "Failed to checkout tag". A full clone is required while the tag is
+        # a bare commit SHA rather than a ref.
+        GIT_SHALLOW FALSE
         UPDATE_DISCONNECTED TRUE
         SOURCE_DIR "${FBINK_SOURCE_DIR}"
         CONFIGURE_COMMAND ""
